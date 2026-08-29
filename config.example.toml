@@ -1,0 +1,33 @@
+signal_cli_url = "http://127.0.0.1:8080"
+
+monitor_group_id = "REPLACE_WITH_MONITOR_GROUP_ID"
+report_group_id = "REPLACE_WITH_REPORT_GROUP_ID"
+
+# Administrative commands work only in this group and only for this explicit
+# ACI UUID allowlist. An empty allowlist disables command control.
+command_group_id = "REPLACE_WITH_COMMAND_GROUP_ID"
+command_author_uuids = []
+
+trigger_texts = [
+    "Всі в укритті?"
+]
+
+# Empty means any sender. An explicit ACI UUID allowlist is strongly recommended.
+trigger_author_uuids = []
+
+accepted_reactions = [
+    "➕"
+]
+
+wait_seconds = 600
+state_db = "/var/lib/sheltercheck/state.sqlite3"
+roster_file = "/var/lib/sheltercheck/roster.csv"
+released_file = "/var/lib/sheltercheck/released_today.txt"
+
+# HTTP and SSE retry behavior.
+connect_timeout_seconds = 5.0
+request_timeout_seconds = 30.0
+sse_read_timeout_seconds = 90.0
+reconnect_initial_seconds = 1.0
+reconnect_max_seconds = 30.0
+edit_debounce_seconds = 1.0

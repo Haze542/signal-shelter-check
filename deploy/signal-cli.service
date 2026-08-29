@@ -1,0 +1,32 @@
+[Unit]
+Description=signal-cli HTTP daemon for ShelterCheck
+Documentation=https://github.com/AsamK/signal-cli
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=sheltercheck
+Group=sheltercheck
+WorkingDirectory=/var/lib/sheltercheck
+Environment=HOME=/var/lib/sheltercheck
+ExecStart=/opt/sheltercheck/signal-cli --scrub-log --data-dir /var/lib/sheltercheck/signal-cli daemon --http 127.0.0.1:8080 --no-receive-stdout --ignore-attachments --ignore-stories --ignore-avatars --ignore-stickers
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sheltercheck/signal-cli
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

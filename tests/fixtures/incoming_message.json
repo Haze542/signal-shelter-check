@@ -1,0 +1,19 @@
+{
+  "jsonrpc": "2.0",
+  "method": "receive",
+  "params": {
+    "envelope": {
+      "sourceUuid": "00000000-0000-4000-8000-000000000010",
+      "timestamp": 1700000000000,
+      "dataMessage": {
+        "timestamp": 1700000000000,
+        "message": "Всі в укритті?",
+        "groupInfo": {
+          "groupId": "SYNTHETIC_MONITOR_GROUP_ID",
+          "type": "DELIVER"
+        }
+      }
+    }
+  }
+}
+

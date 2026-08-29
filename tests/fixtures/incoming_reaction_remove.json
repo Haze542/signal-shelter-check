@@ -1,0 +1,25 @@
+{
+  "jsonrpc": "2.0",
+  "method": "receive",
+  "params": {
+    "envelope": {
+      "sourceUuid": "00000000-0000-4000-8000-000000000001",
+      "timestamp": 1700000002000,
+      "dataMessage": {
+        "timestamp": 1700000002000,
+        "message": null,
+        "reaction": {
+          "emoji": "➕",
+          "targetAuthorUuid": "00000000-0000-4000-8000-000000000010",
+          "targetSentTimestamp": 1700000000000,
+          "isRemove": true
+        },
+        "groupInfo": {
+          "groupId": "SYNTHETIC_MONITOR_GROUP_ID",
+          "type": "DELIVER"
+        }
+      }
+    }
+  }
+}
+
