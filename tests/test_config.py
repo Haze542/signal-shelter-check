@@ -17,6 +17,8 @@ def test_example_config_is_structurally_valid() -> None:
     config = load_config(root / "config.example.toml", require_groups=False)
     assert config.signal_cli_url == "http://127.0.0.1:8080"
     assert config.wait_seconds == 600
+    assert config.intermediate_check_seconds == 300
+    assert config.active_check_ttl_seconds == 21_600
     assert config.command_group_id
     assert config.command_author_uuids == frozenset()
     assert config.state_db == Path("/var/lib/sheltercheck/state.sqlite3")
@@ -48,6 +50,40 @@ command_author_uuids = []
     assert config.command_group_id == ""
     assert config.command_author_uuids == frozenset()
     assert config.command_control_enabled is False
+
+
+def test_existing_config_without_new_timing_keys_uses_defaults(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "config.example.toml").read_text(encoding="utf-8")
+    text = text.replace("intermediate_check_seconds = 300\n", "")
+    text = text.replace("active_check_ttl_seconds = 21600\n", "")
+    path = tmp_path / "legacy-timing.toml"
+    path.write_text(text, encoding="utf-8")
+
+    config = load_config(path, require_groups=False)
+    assert config.intermediate_check_seconds == 300
+    assert config.active_check_ttl_seconds == 21_600
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [
+        ("intermediate_check_seconds = 300", "intermediate_check_seconds = 0"),
+        ("intermediate_check_seconds = 300", "intermediate_check_seconds = 600"),
+        ("active_check_ttl_seconds = 21600", "active_check_ttl_seconds = 600"),
+        ("wait_seconds = 600", "wait_seconds = -1"),
+    ],
+)
+def test_invalid_lifecycle_timing_is_rejected(
+    tmp_path: Path, old: str, new: str
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "config.example.toml").read_text(encoding="utf-8")
+    path = tmp_path / "bad-timing.toml"
+    path.write_text(text.replace(old, new), encoding="utf-8")
+
+    with pytest.raises(ConfigError):
+        load_config(path, require_groups=False)
 
 
 def test_command_authors_require_group_and_valid_aci(tmp_path: Path) -> None:

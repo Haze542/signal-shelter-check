@@ -3,10 +3,11 @@
 ShelterCheck автоматично контролює перевірки в Signal:
 
 1. бачить повідомлення «Всі в укритті?»;
-2. чекає заданий час, наприклад 10 хвилин;
-3. перевіряє реакції `➕` від людей зі списку звільнених;
-4. надсилає звіт про тих, хто не відреагував;
-5. редагує той самий звіт, якщо реакція з’явилася пізніше.
+2. фіксує snapshot звільнених і перевіряє reactions `➕` саме для нього;
+3. через заданий час, наприклад 5 хвилин, надсилає проміжний звіт;
+4. у final deadline, наприклад через 10 хвилин, надсилає authoritative звіт;
+5. завершує перевірку одразу після `N/N`, не чекаючи наступного deadline;
+6. старі активні перевірки silent-expire за TTL, типово через 6 годин.
 
 Програма також дозволяє авторизованому сержанту керувати списком звільнених
 через команди Signal.
@@ -162,6 +163,32 @@ released_file = "/var/lib/sheltercheck/released_today.txt"
 state_db = "/var/lib/sheltercheck/state.sqlite3"
 ```
 
+Lifecycle timers:
+
+```toml
+intermediate_check_seconds = 300
+wait_seconds = 600
+active_check_ttl_seconds = 21600
+```
+
+Це означає: через 5 хвилин — максимум один проміжний report, через 10 хвилин —
+final evaluation, через 6 годин — silent expiry без Signal send/edit. Має виконуватися
+`0 < intermediate_check_seconds < wait_seconds < active_check_ttl_seconds`. Обидва
+нові ключі optional: старий deployed config без них використовує defaults `300` і
+`21600`.
+
+Проміжний report не завершує session і показує current missing snapshot цієї
+перевірки. Final report окремий і authoritative. Completion також має окремий
+короткий формат, наприклад:
+
+```text
+✅ Усі 17/17 відмітилися.
+Перевірку завершено за 4 хв 21 с.
+```
+
+Якщо final report уже успішно надісланий, completion робить одну edit attempt цього
+report. Якщо final report ще не існує, completion робить одну окрему send attempt.
+
 #### 3. Заповнити roster
 
 ```bash
@@ -283,8 +310,32 @@ Released list також можна змінювати дозволеними Si
 | `/addrt` + імена | Додати людей, не дублюючи тих, хто вже є. |
 | `/delrt` + імена | Видалити людей зі списку. |
 | `/clearrt confirm` | Очистити список; без слова `confirm` очищення не відбудеться. |
-| `/status` | Показати доступний стан системи. |
+| `/check` | Виконати manual evaluation останньої стандартної перевірки. |
+| `/check <текст>` | Почати або перевірити session для найновішого отриманого повідомлення офіцера з exact normalized text. |
+| `/status` | Показати стан системи, uptime і detail найновішої активної перевірки. |
 | `/help` | Показати коротку довідку. |
+
+`/check` не створює новий AlarmSession і не скидає trigger time, intermediate,
+final або TTL останньої standard-перевірки. Якщо вона terminal, новий report не
+створюється.
+
+`/check <текст>` потрібна для нестандартного контрольного повідомлення, якого немає
+в `trigger_texts`. ShelterChecker шукає найновіше повідомлення лише в
+`monitor_group_id`, лише від автора з `trigger_author_uuids`, і лише за exact equality
+після `normalize_text()` (Unicode NFKC, trim/collapse whitespace, casefold). Fuzzy,
+substring і regex matching немає.
+
+ShelterChecker не читає server-side Signal history. Він може знайти тільки message і
+reactions, events яких реально отримав під час роботи. Для цього локально зберігається
+обмежена 24-годинна candidate history тільки для monitor group та дозволених
+officer authors. Add/remove reactions, отримані до `/check <текст>`, replay-яться за
+event timestamp, тому manual session одразу має правильний current response state.
+
+Для custom session original officer timestamp залишається reaction target і часом
+«Контрольного повідомлення». `tracking_started_at_ms` фіксується окремо в момент
+`/check <текст>`; intermediate/final/TTL та elapsed рахуються від нього. Snapshot
+released list також фіксується саме в момент запуску manual check, а не в момент
+написання officer message.
 
 ### Логи, restart і stop
 
@@ -504,12 +555,59 @@ Reaction routing перевіряє group, точний target timestamp і targ
 присутній. На момент trigger released members snapshot-яться у SQLite. Пізні зміни
 `released_today.txt` не змінюють активний alert.
 
-Initial report claim записується у SQLite до Signal RPC. Відомий JSON-RPC reject
-можна retry; неоднозначний HTTP timeout автоматично не повторюється, щоб не створити
-дублікат. Report edits і immutable deadline snapshot переживають restart.
+AlarmSession має чітку state machine:
+
+```text
+active:   pending → reported
+terminal: completed | expired | stale | error
+```
+
+`completed` і `expired` справді terminal: наступні reaction add/remove не змінюють
+responded/missing state, не reopen session і не породжують send/edit. `pending`
+переходить у `reported` після final evaluation із missing members. Останній accepted
+`+` у будь-якому active state одразу запускає completion. TTL має пріоритет над усіма
+reports та silent-переводить `pending/reported` у `expired`.
+
+`trigger_timestamp_ms` — timestamp original Signal message для reaction routing і
+display time. `tracking_started_at_ms` — початок timer lifecycle. Для automatic
+standard alarm вони однакові; для custom `/check <текст>` tracking починається в
+момент команди.
+
+Кожна logical outgoing operation записується у SQLite до Signal RPC зі станом, що
+розрізняє `not_due`, `due_not_attempted`, success, explicit failure, uncertain
+delivery і skipped. Гарантія writes — **at-most-once attempt**. ShelterChecker не
+retry-ить failed sends, edits або command replies у ticker, після іншої події чи
+після restart. Timeout/connection reset після початку RPC вважається uncertain і
+також ніколи автоматично не повторюється. Це свідомо віддає перевагу пропущеному
+повідомленню над duplicate Signal message.
+
+Signal send results перевіряються не лише за `timestamp`, а й за recipient `results`.
+Перший `RATE_LIMIT_FAILURE` або proof-required challenge latch-ить centralized
+outgoing circuit breaker у `SignalClient`. Усі наступні report sends, edits і command
+replies блокуються до RPC. Автоматичного reset за `retryAfterSeconds` немає; outgoing
+залишається disabled до restart process. Процес не завершується: incoming SSE,
+reaction tracking, SQLite transitions, TTL і local cleanup продовжують працювати.
+Rate limit записується лише в local critical log — ShelterChecker не намагається
+повідомити про нього через Signal.
 
 SQLite schema migrations виконуються backward-safe. Невідома або пошкоджена schema
 має завершити startup/health із помилкою, а не мовчки видалити state.
+
+`/status` показує health Signal, roster/current released counts, кількість лише
+`pending/reported` sessions, last check і uptime поточного process із monotonic clock.
+Нижній block показує тільки latest active session та використовує її immutable
+released snapshot:
+
+```text
+Перевірка: активна
+Контрольне повідомлення: 23:41
+Минуло: 6 хв 12 с
+Відмітилися: 14/17
+Очікуються: 3
+```
+
+Верхній `Released today` при цьому читає current released list. Якщо active session
+немає, block містить `Перевірка: неактивна`.
 
 ### Signal-команди
 
@@ -532,6 +630,8 @@ write використовує private temporary file в тому самому f
 
 - `signal-cli` API не можна публікувати через reverse proxy або firewall port-forward;
 - normal logs не містять телефонів або повних command payload;
+- observed history містить лише 24 години candidate messages дозволених officer
+  authors у monitor group та потрібні reaction events; це не архів Signal chat;
 - unit використовує `--scrub-log --no-receive-stdout`;
 - `tools/dump_events.py` може показати personal data й призначений лише для локальної
   діагностики в ignored `debug_events/`;

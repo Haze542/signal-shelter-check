@@ -6,6 +6,7 @@ import contextlib
 import logging
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 from .admin_cli import run_released_command
@@ -80,7 +81,14 @@ async def _ticker(tracker: AlertTracker) -> None:
         await asyncio.sleep(0.25)
 
 
-async def _run(config: Config, *, dry_run: bool) -> None:
+async def _run(
+    config: Config,
+    *,
+    dry_run: bool,
+    process_started_monotonic: float | None = None,
+) -> None:
+    if process_started_monotonic is None:
+        process_started_monotonic = time.monotonic()
     roster = load_roster(config.roster_file)
     database = StateDatabase(":memory:" if dry_run else config.state_db)
     released_list = ReleasedListService(config.released_file, in_memory=dry_run)
@@ -116,6 +124,8 @@ async def _run(config: Config, *, dry_run: bool) -> None:
                 command_publisher,
                 database,
                 signal_health_check=signal_health_check,
+                tracker=tracker,
+                process_started_monotonic=process_started_monotonic,
             )
 
             print(f"Roster: {len(roster)} members")
@@ -128,10 +138,10 @@ async def _run(config: Config, *, dry_run: bool) -> None:
                 )
             if dry_run:
                 print("Mode: dry-run (state is in memory; Signal sends are disabled)")
-            uncertain = database.list_uncertain_initial_reports()
+            uncertain = database.list_uncertain_outgoing_operations()
             if uncertain:
                 LOGGER.critical(
-                    "%d initial report send(s) have uncertain delivery and will not be retried automatically; inspect local state and Signal",
+                    "%d outgoing operation(s) have uncertain delivery and will not be retried automatically; inspect local state and Signal",
                     len(uncertain),
                 )
             print("Waiting for trigger...", flush=True)
@@ -153,6 +163,7 @@ async def _run(config: Config, *, dry_run: bool) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    process_started_monotonic = time.monotonic()
     args = _arguments(argv)
     logging.basicConfig(
         level=logging.INFO,
@@ -182,7 +193,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Roster: {len(roster)} members")
             print(f"Released today: {len(released)} members")
             return 0
-        asyncio.run(_run(config, dry_run=args.dry_run))
+        asyncio.run(
+            _run(
+                config,
+                dry_run=args.dry_run,
+                process_started_monotonic=process_started_monotonic,
+            )
+        )
     except KeyboardInterrupt:
         return 130
     except (

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -20,9 +21,35 @@ class SignalClientError(RuntimeError):
 
 
 class SignalRPCError(SignalClientError):
-    def __init__(self, code: int | None, message: str) -> None:
+    def __init__(self, code: int | None, message: str, *, data: Any = None) -> None:
         self.code = code
+        self.data = data
         super().__init__(f"signal-cli JSON-RPC error {code}: {message}")
+
+
+class SignalRateLimitedError(SignalClientError):
+    def __init__(
+        self,
+        failure_type: str,
+        *,
+        retry_after_seconds: int | None = None,
+        token: str | None = None,
+    ) -> None:
+        self.failure_type = failure_type
+        self.retry_after_seconds = retry_after_seconds
+        self.token = token
+        details = [failure_type]
+        if retry_after_seconds is not None:
+            details.append(f"retryAfterSeconds={retry_after_seconds}")
+        if token is not None:
+            details.append("proof token present")
+        super().__init__(
+            "signal-cli outgoing rate limit/proof challenge: " + ", ".join(details)
+        )
+
+
+class SignalOutgoingDisabledError(SignalClientError):
+    """A write was blocked locally after the process-wide client breaker tripped."""
 
 
 class SignalClient:
@@ -45,6 +72,17 @@ class SignalClient:
         self.reconnect_initial_seconds = reconnect_initial_seconds
         self.reconnect_max_seconds = reconnect_max_seconds
         self._session: aiohttp.ClientSession | None = None
+        self._outgoing_disabled = False
+        self._rate_limit_failure: SignalRateLimitedError | None = None
+        self._outgoing_lock = asyncio.Lock()
+
+    @property
+    def outgoing_enabled(self) -> bool:
+        return not self._outgoing_disabled
+
+    @property
+    def rate_limit_failure(self) -> SignalRateLimitedError | None:
+        return self._rate_limit_failure
 
     async def __aenter__(self) -> SignalClient:
         if self._session is not None:
@@ -79,6 +117,8 @@ class SignalClient:
             raise SignalClientError(f"signal-cli health check failed: {exc}") from exc
 
     async def rpc(self, method: str, params: dict[str, Any]) -> Any:
+        if method == "send":
+            self._ensure_outgoing_enabled()
         session = self._require_session()
         request_id = uuid.uuid4().hex
         request = {
@@ -110,29 +150,87 @@ class SignalClient:
             raise SignalClientError("signal-cli returned a mismatched JSON-RPC response id")
         error = payload.get("error")
         if isinstance(error, dict):
+            rate_limit = _rate_limit_from_value(error)
+            if rate_limit is not None:
+                self._trip_outgoing(rate_limit)
+                raise rate_limit
             code = error.get("code") if isinstance(error.get("code"), int) else None
             message = error.get("message")
-            raise SignalRPCError(code, message if isinstance(message, str) else "unknown error")
+            raise SignalRPCError(
+                code,
+                message if isinstance(message, str) else "unknown error",
+                data=error.get("data"),
+            )
         if "result" not in payload:
             raise SignalClientError("signal-cli JSON-RPC response has no result")
         return payload["result"]
 
     async def send_group_message(self, group_id: str, message: str) -> int:
-        result = await self.rpc("send", {"groupId": group_id, "message": message})
-        return _result_timestamp(result)
+        async with self._outgoing_lock:
+            self._ensure_outgoing_enabled()
+            result = await self.rpc(
+                "send", {"groupId": group_id, "message": message}
+            )
+            return self._validate_send_result(result)
 
     async def edit_group_message(
         self, group_id: str, message: str, edit_timestamp_ms: int
     ) -> int:
-        result = await self.rpc(
-            "send",
-            {
-                "groupId": group_id,
-                "message": message,
-                "editTimestamp": edit_timestamp_ms,
-            },
-        )
+        async with self._outgoing_lock:
+            self._ensure_outgoing_enabled()
+            result = await self.rpc(
+                "send",
+                {
+                    "groupId": group_id,
+                    "message": message,
+                    "editTimestamp": edit_timestamp_ms,
+                },
+            )
+            return self._validate_send_result(result)
+
+    def _ensure_outgoing_enabled(self) -> None:
+        if self._outgoing_disabled:
+            raise SignalOutgoingDisabledError(
+                "Signal outgoing writes are disabled until process restart"
+            )
+
+    def _validate_send_result(self, result: Any) -> int:
+        rate_limit = _rate_limit_from_value(result)
+        if rate_limit is not None:
+            self._trip_outgoing(rate_limit)
+            raise rate_limit
+
+        if isinstance(result, dict) and "results" in result:
+            results = result["results"]
+            if not isinstance(results, list):
+                raise SignalClientError("signal-cli send results field is not an array")
+            for entry in results:
+                if not isinstance(entry, dict):
+                    raise SignalClientError("signal-cli send result entry is not an object")
+                result_type = entry.get("type")
+                if isinstance(result_type, str) and (
+                    result_type.upper().endswith("_FAILURE")
+                    or result_type.upper() in {"FAILURE", "ERROR"}
+                ):
+                    raise SignalRPCError(
+                        None,
+                        f"signal-cli send result reported {result_type}",
+                        data=entry,
+                    )
         return _result_timestamp(result)
+
+    def _trip_outgoing(self, failure: SignalRateLimitedError) -> None:
+        if self._outgoing_disabled:
+            return
+        self._outgoing_disabled = True
+        self._rate_limit_failure = failure
+        LOGGER.critical(
+            "Signal outgoing disabled at timestamp=%d after %s; retryAfterSeconds=%s; "
+            "breaker remains latched until process restart",
+            time.time_ns() // 1_000_000,
+            failure.failure_type,
+            failure.retry_after_seconds,
+        )
 
     async def events(self) -> AsyncIterator[dict[str, Any]]:
         """Yield decoded SSE data objects, reconnecting forever with bounded backoff."""
@@ -237,3 +335,45 @@ def _result_timestamp(result: Any) -> int:
     if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp <= 0:
         raise SignalClientError("signal-cli send result has no valid timestamp")
     return timestamp
+
+
+def _rate_limit_from_value(value: Any) -> SignalRateLimitedError | None:
+    """Find explicit rate-limit/proof-required evidence in a send result or error."""
+
+    if isinstance(value, dict):
+        raw_type = value.get("type")
+        failure_type = raw_type if isinstance(raw_type, str) else ""
+        upper_type = failure_type.upper()
+        token_value = value.get("token")
+        token = token_value if isinstance(token_value, str) and token_value else None
+        retry_value = value.get("retryAfterSeconds")
+        retry_after = (
+            retry_value
+            if isinstance(retry_value, int) and not isinstance(retry_value, bool)
+            else None
+        )
+        proof_key_present = any(
+            key in value and value[key] is not None
+            for key in ("proofRequiredFailure", "proofRequired", "challenge")
+        )
+        if (
+            upper_type == "RATE_LIMIT_FAILURE"
+            or "PROOF_REQUIRED" in upper_type
+            or token is not None
+            or proof_key_present
+        ):
+            return SignalRateLimitedError(
+                failure_type or "PROOF_REQUIRED_CHALLENGE",
+                retry_after_seconds=retry_after,
+                token=token,
+            )
+        for nested in value.values():
+            found = _rate_limit_from_value(nested)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for nested in value:
+            found = _rate_limit_from_value(nested)
+            if found is not None:
+                return found
+    return None

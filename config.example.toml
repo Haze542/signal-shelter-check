@@ -19,12 +19,15 @@ accepted_reactions = [
     "➕"
 ]
 
+# 5 min intermediate, 10 min authoritative final, 6 h silent active-check TTL.
+intermediate_check_seconds = 300
 wait_seconds = 600
+active_check_ttl_seconds = 21600
 state_db = "/var/lib/sheltercheck/state.sqlite3"
 roster_file = "/var/lib/sheltercheck/roster.csv"
 released_file = "/var/lib/sheltercheck/released_today.txt"
 
-# HTTP and SSE retry behavior.
+# HTTP timeouts and receive-side SSE reconnect behavior (not outgoing write retries).
 connect_timeout_seconds = 5.0
 request_timeout_seconds = 30.0
 sse_read_timeout_seconds = 90.0

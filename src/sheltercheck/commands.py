@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -8,8 +9,10 @@ from typing import Protocol
 
 from .config import Config
 from .database import StateDatabase
-from .models import MessageEvent, NormalizedEvent
+from .models import ForceCheckResult, MessageEvent, NormalizedEvent
+from .outgoing import attempt_outgoing_once
 from .released_list import ReleasedListError, ReleasedListService
+from .reporter import format_duration
 from .roster import Roster
 from .signal_client import SignalClient
 
@@ -23,7 +26,9 @@ HELP_TEXT = """Доступні команди:
 /addrt — додати людей
 /delrt — видалити людей
 /clearrt confirm — очистити список
-/status — стан системи
+/check — перевірити останнє стандартне контрольне повідомлення
+/check <текст> — перевірити повідомлення офіцера з указаним текстом
+/status — стан системи та поточної перевірки
 /help — довідка"""
 
 _SUPPORTED_COMMANDS = {
@@ -32,6 +37,7 @@ _SUPPORTED_COMMANDS = {
     "/addrt",
     "/delrt",
     "/clearrt",
+    "/check",
     "/status",
     "/help",
 }
@@ -39,6 +45,12 @@ _SUPPORTED_COMMANDS = {
 
 class CommandReplyPublisher(Protocol):
     async def send(self, group_id: str, message: str) -> None: ...
+
+
+class CheckTracker(Protocol):
+    async def force_check_latest(self) -> ForceCheckResult: ...
+
+    async def force_check_message(self, text: str) -> ForceCheckResult: ...
 
 
 class SignalCommandReplyPublisher:
@@ -62,6 +74,7 @@ class ParsedCommand:
     token: str
     arguments: tuple[str, ...]
     names: tuple[str, ...]
+    text_argument: str
 
 
 class CommandHandler:
@@ -76,6 +89,10 @@ class CommandHandler:
         database: StateDatabase,
         *,
         signal_health_check: Callable[[], Awaitable[bool]],
+        tracker: CheckTracker | None = None,
+        clock_ms: Callable[[], int] | None = None,
+        monotonic_clock: Callable[[], float] | None = None,
+        process_started_monotonic: float | None = None,
     ) -> None:
         self.config = config
         self.roster = roster
@@ -83,6 +100,14 @@ class CommandHandler:
         self.publisher = publisher
         self.database = database
         self._signal_health_check = signal_health_check
+        self._tracker = tracker
+        self._clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
+        self._monotonic_clock = monotonic_clock or time.monotonic
+        self._process_started_monotonic = (
+            self._monotonic_clock()
+            if process_started_monotonic is None
+            else process_started_monotonic
+        )
 
     async def handle_event(self, event: NormalizedEvent) -> bool:
         """Return true for slash messages so they never reach alert trigger logic."""
@@ -101,6 +126,12 @@ class CommandHandler:
         if command.token not in _SUPPORTED_COMMANDS:
             return True
 
+        operation_key = (
+            f"command_reply:{event.group_id}:{event.sender_aci}:{event.sent_timestamp_ms}"
+        )
+        if self.database.get_outgoing(operation_key) is not None:
+            return True
+
         LOGGER.info(
             "Authorized Signal command %s from ACI %s",
             command.token,
@@ -112,13 +143,29 @@ class CommandHandler:
             LOGGER.error("Signal command %s failed: %s", command.token, exc)
             response = "❌ Не вдалося оновити список.\n\nПоточний список залишився без змін."
 
-        try:
+        now_ms = self._clock_ms()
+        self.database.prepare_outgoing(
+            operation_key=operation_key,
+            kind="command_reply",
+            state="due_not_attempted",
+            now_ms=now_ms,
+        )
+
+        async def send_reply() -> None:
             await self.publisher.send(self.config.command_group_id, response)
-        except Exception as exc:
+
+        result = await attempt_outgoing_once(
+            self.database,
+            operation_key,
+            now_ms=now_ms,
+            write=send_reply,
+        )
+        if result.state != "attempted_success":
             LOGGER.error(
-                "Could not send reply for Signal command %s: %s",
+                "Signal command %s reply ended as %s and will not be retried: %s",
                 command.token,
-                exc,
+                result.state,
+                result.error,
             )
         return True
 
@@ -135,6 +182,8 @@ class CommandHandler:
             return await self._delete(command)
         if command.token == "/clearrt":
             return await self._clear(command)
+        if command.token == "/check":
+            return await self._check(command)
         if command.token == "/status":
             if command.arguments or command.names:
                 return _invalid_format("/status")
@@ -142,6 +191,15 @@ class CommandHandler:
         if command.arguments or command.names:
             return _invalid_format("/help")
         return HELP_TEXT
+
+    async def _check(self, command: ParsedCommand) -> str:
+        if self._tracker is None:
+            return "❌ Перевірка зараз недоступна."
+        if command.text_argument:
+            result = await self._tracker.force_check_message(command.text_argument)
+        else:
+            result = await self._tracker.force_check_latest()
+        return _format_check_result(result)
 
     async def _set(self, command: ParsedCommand) -> str:
         if command.arguments:
@@ -221,7 +279,6 @@ class CommandHandler:
         released_count = len(await self.released_list.get())
         lines = [
             "ShelterCheck: 🟢 працює",
-            "",
             f"Signal: {'🟢 connected' if signal_connected else '🔴 disconnected'}",
             f"Roster: {len(self.roster)}",
             f"Released today: {released_count}",
@@ -231,6 +288,35 @@ class CommandHandler:
         if last_check is not None:
             check_time = datetime.fromtimestamp(last_check / 1000).astimezone()
             lines.append(f"Last check: {check_time:%H:%M}")
+        else:
+            lines.append("Last check: немає")
+        uptime_seconds = max(
+            0, int(self._monotonic_clock() - self._process_started_monotonic)
+        )
+        lines.append(f"Up time: {format_duration(uptime_seconds)}")
+        lines.append("")
+        active = self.database.latest_active_alarm()
+        if active is None:
+            lines.append("Перевірка: неактивна")
+            return "\n".join(lines)
+
+        check_time = datetime.fromtimestamp(
+            active.trigger_timestamp_ms / 1000
+        ).astimezone()
+        elapsed_seconds = max(
+            0, (self._clock_ms() - active.tracking_started_at_ms) // 1000
+        )
+        missing = len(active.missing_members)
+        total = len(active.released_members)
+        lines.extend(
+            [
+                "Перевірка: активна",
+                f"Контрольне повідомлення: {check_time:%H:%M}",
+                f"Минуло: {format_duration(elapsed_seconds)}",
+                f"Відмітилися: {total - missing}/{total}",
+                f"Очікуються: {missing}",
+            ]
+        )
         return "\n".join(lines)
 
 
@@ -239,7 +325,38 @@ def _parse_command(text: str) -> ParsedCommand:
     parts = first_line.strip().split()
     token = parts[0].casefold() if parts else ""
     names = tuple(line.strip() for line in payload_lines if line.strip())
-    return ParsedCommand(token, tuple(parts[1:]), names)
+    stripped = text.strip()
+    text_argument = stripped[len(parts[0]) :].strip() if parts else ""
+    return ParsedCommand(token, tuple(parts[1:]), names, text_argument)
+
+
+def _format_check_result(result: ForceCheckResult) -> str:
+    if result.outcome == "no_standard":
+        return "Контрольних повідомлень ще не зафіксовано."
+    if result.outcome == "message_not_found":
+        return (
+            "Повідомлення для перевірки не знайдено.\n\n"
+            "ShelterChecker може перевірити лише повідомлення, які він уже отримав."
+        )
+    if result.outcome == "terminal":
+        status = result.alarm.status if result.alarm is not None else "terminal"
+        return f"Перевірка вже неактивна ({status}). Новий звіт не створено."
+    if result.alarm is None:
+        return "❌ Не вдалося виконати перевірку."
+    total = len(result.alarm.released_members)
+    missing = len(result.alarm.missing_members)
+    if result.outcome == "completed":
+        return f"✅ Усі {total}/{total} відмітилися. Перевірку завершено."
+    prefix = (
+        "Перевірку розпочато й виконано."
+        if result.created
+        else "Перевірку виконано."
+    )
+    return (
+        f"{prefix}\n\n"
+        f"Відмітилися: {total - missing}/{total}\n"
+        f"Очікуються: {missing}"
+    )
 
 
 def _validate_names(

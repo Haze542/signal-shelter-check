@@ -141,7 +141,7 @@ def test_wrong_target_author_is_ignored(app_config, roster) -> None:
         database.close()
 
 
-def test_initial_report_late_reactions_debounce_and_all_confirmed(app_config, roster) -> None:
+def test_final_report_late_reactions_complete_immediately(app_config, roster) -> None:
     clock = Clock(TRIGGER_TS)
     database, publisher, tracker = build(app_config, roster, clock)
     try:
@@ -163,23 +163,20 @@ def test_initial_report_late_reactions_debounce_and_all_confirmed(app_config, ro
         run(tracker.handle_event(reaction(ACI_2, sent=clock.value)))
         clock.value += 100
         run(tracker.handle_event(reaction(ACI_3, sent=clock.value)))
-        run(tracker.process_due(clock.value + 999))
-        assert publisher.edits == []
-        run(tracker.process_due(clock.value + 1_000))
 
         assert len(publisher.edits) == 1
         assert publisher.edits[0][0] == report_timestamp
         edited = publisher.edits[0][1]
-        assert "🟢 | Петренко П.П | +380502222222" in edited
-        assert "🟢 | Коваль А.А | +380503333333" in edited
-        assert "Усі 3/3 поставили +." in edited
-        assert "Іваненко І.І" not in edited
+        assert edited == (
+            "✅ Усі 3/3 відмітилися.\n"
+            "Перевірку завершено за 10 с."
+        )
         assert database.list_alarms()[0].status == "completed"
     finally:
         database.close()
 
 
-def test_all_confirmed_before_deadline_sends_one_completed_report(app_config, roster) -> None:
+def test_all_confirmed_before_deadline_completes_immediately_once(app_config, roster) -> None:
     clock = Clock(TRIGGER_TS)
     database, publisher, tracker = build(app_config, roster, clock)
     try:
@@ -187,12 +184,13 @@ def test_all_confirmed_before_deadline_sends_one_completed_report(app_config, ro
         run(tracker.handle_event(reaction(ACI_1, sent=TRIGGER_TS + 1)))
         run(tracker.handle_event(reaction(ACI_2, sent=TRIGGER_TS + 2)))
         run(tracker.handle_event(reaction(ACI_3, sent=TRIGGER_TS + 3)))
+        assert len(publisher.sends) == 1
         clock.value = TRIGGER_TS + 10_000
         run(tracker.process_due())
         run(tracker.process_due())
 
         assert len(publisher.sends) == 1
-        assert "Усі 3/3 поставили +." in publisher.sends[0]
+        assert "✅ Усі 3/3 відмітилися." in publisher.sends[0]
         assert "Іваненко І.І" not in publisher.sends[0]
         assert database.list_alarms()[0].initial_missing == ()
         assert database.list_alarms()[0].status == "completed"
@@ -223,7 +221,7 @@ def test_late_reaction_keeps_row_and_removes_numbering(app_config, roster) -> No
         database.close()
 
 
-def test_two_missing_update_independently_and_completed_report_can_reopen(
+def test_two_missing_update_independently_and_completed_report_is_terminal(
     app_config, roster
 ) -> None:
     clock = Clock(TRIGGER_TS)
@@ -247,12 +245,10 @@ def test_two_missing_update_independently_and_completed_report_can_reopen(
         run(tracker.handle_event(reaction(ACI_3, sent=clock.value)))
         run(tracker.process_due(clock.value + 1_000))
         all_late = publisher.edits[-1][1]
-        assert "Перевірка " in all_late
-        assert "🟢 | Петренко П.П | +380502222222" in all_late
-        assert "🟢 | Коваль А.А | +380503333333" in all_late
-        assert "Усі 3/3 поставили +." in all_late
+        assert "✅ Усі 3/3 відмітилися." in all_late
         assert database.list_alarms()[0].status == "completed"
 
+        edit_count = len(publisher.edits)
         clock.value += 1_001
         run(
             tracker.handle_event(
@@ -260,13 +256,11 @@ def test_two_missing_update_independently_and_completed_report_can_reopen(
             )
         )
         run(tracker.process_due(clock.value + 1_000))
-        reopened = publisher.edits[-1][1]
-        assert "Не поставили +" in reopened
-        assert "1/3" in reopened
-        assert "🔴 | Петренко П.П | +380502222222" in reopened
-        assert "🟢 | Коваль А.А | +380503333333" in reopened
-        assert "Усі 3/3" not in reopened
-        assert database.list_alarms()[0].status == "reported"
+        assert len(publisher.edits) == edit_count
+        assert database.list_alarms()[0].status == "completed"
+        assert database.list_alarms()[0].responded_acis == frozenset(
+            {ACI_1, ACI_2, ACI_3}
+        )
     finally:
         database.close()
 
@@ -456,6 +450,13 @@ def test_existing_database_schema_is_migrated_with_initial_missing(
         assert [member.signal_aci for member in alarm.initial_missing] == [ACI_2, ACI_3]
         assert alarm.responded_acis == frozenset({ACI_1, ACI_2})
         assert alarm.report_message_timestamp_ms == 9_000_001
+        assert alarm.tracking_started_at_ms == TRIGGER_TS
+        assert alarm.intermediate_deadline_timestamp_ms == TRIGGER_TS + 10_000
+        assert alarm.expires_timestamp_ms == TRIGGER_TS + 21_600_000
+        assert alarm.source == "standard"
+        operation = database.get_outgoing("alarm:1:final")
+        assert operation is not None
+        assert operation.state == "attempted_success"
     finally:
         database.close()
 
@@ -499,16 +500,17 @@ def test_invalid_released_file_records_error_without_report(app_config, roster) 
         database.close()
 
 
-def test_stale_trigger_is_snapshotted_but_never_reported(app_config, roster) -> None:
+def test_late_trigger_before_ttl_runs_only_final_evaluation(app_config, roster) -> None:
     clock = Clock(TRIGGER_TS + 10_001)
     database, publisher, tracker = build(app_config, roster, clock)
     try:
         run(tracker.handle_event(trigger()))
         alarm = database.list_alarms()[0]
-        assert alarm.status == "stale"
+        assert alarm.status == "pending"
         assert len(alarm.released_members) == 3
         run(tracker.process_due())
-        assert publisher.sends == []
+        assert len(publisher.sends) == 1
+        assert database.list_alarms()[0].status == "reported"
     finally:
         database.close()
 

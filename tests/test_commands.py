@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 from dataclasses import replace
 
 from sheltercheck.commands import CommandHandler, HELP_TEXT
@@ -25,8 +26,22 @@ def run(coroutine: object) -> object:
     return asyncio.run(coroutine)  # type: ignore[arg-type]
 
 
-def command(text: str, *, sender: str = AUTHOR, group: str = "command-group") -> MessageEvent:
-    return MessageEvent(group, sender, TRIGGER_TS, text)
+COMMAND_TIMESTAMPS = itertools.count(TRIGGER_TS)
+
+
+def command(
+    text: str,
+    *,
+    sender: str = AUTHOR,
+    group: str = "command-group",
+    timestamp: int | None = None,
+) -> MessageEvent:
+    return MessageEvent(
+        group,
+        sender,
+        next(COMMAND_TIMESTAMPS) if timestamp is None else timestamp,
+        text,
+    )
 
 
 def build_handler(app_config, roster):

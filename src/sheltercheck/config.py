@@ -38,6 +38,8 @@ _OPTIONAL_KEYS = {
     "reconnect_initial_seconds",
     "reconnect_max_seconds",
     "edit_debounce_seconds",
+    "intermediate_check_seconds",
+    "active_check_ttl_seconds",
 }
 
 
@@ -105,10 +107,20 @@ class Config:
     reconnect_initial_seconds: float = 1.0
     reconnect_max_seconds: float = 30.0
     edit_debounce_seconds: float = 1.0
+    intermediate_check_seconds: int = 300
+    active_check_ttl_seconds: int = 21_600
 
     @property
     def wait_milliseconds(self) -> int:
         return self.wait_seconds * 1000
+
+    @property
+    def intermediate_check_milliseconds(self) -> int:
+        return self.intermediate_check_seconds * 1000
+
+    @property
+    def active_check_ttl_milliseconds(self) -> int:
+        return self.active_check_ttl_seconds * 1000
 
     @property
     def edit_debounce_milliseconds(self) -> int:
@@ -146,6 +158,13 @@ def _positive_number(data: dict[str, Any], key: str, default: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
         raise ConfigError(f"{key} must be a positive number")
     return float(value)
+
+
+def _positive_integer(data: dict[str, Any], key: str, default: int) -> int:
+    value = data.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ConfigError(f"{key} must be a positive integer")
+    return value
 
 
 def _resolve_path(config_dir: Path, value: str) -> Path:
@@ -204,9 +223,20 @@ def load_config(path: str | Path = "config.toml", *, require_groups: bool = True
             "command_group_id must not be empty when command_author_uuids is configured"
         )
 
-    wait_seconds = data.get("wait_seconds")
-    if isinstance(wait_seconds, bool) or not isinstance(wait_seconds, int) or wait_seconds <= 0:
-        raise ConfigError("wait_seconds must be a positive integer")
+    wait_seconds = _positive_integer(data, "wait_seconds", 600)
+    intermediate_check_seconds = _positive_integer(
+        data, "intermediate_check_seconds", 300
+    )
+    active_check_ttl_seconds = _positive_integer(
+        data, "active_check_ttl_seconds", 21_600
+    )
+    if not (
+        intermediate_check_seconds < wait_seconds < active_check_ttl_seconds
+    ):
+        raise ConfigError(
+            "timing values must satisfy "
+            "0 < intermediate_check_seconds < wait_seconds < active_check_ttl_seconds"
+        )
 
     config_dir = config_path.resolve().parent
     reconnect_initial = _positive_number(data, "reconnect_initial_seconds", 1.0)
@@ -227,6 +257,8 @@ def load_config(path: str | Path = "config.toml", *, require_groups: bool = True
         state_db=_resolve_path(config_dir, _string(data, "state_db")),
         roster_file=_resolve_path(config_dir, _string(data, "roster_file")),
         released_file=_resolve_path(config_dir, _string(data, "released_file")),
+        intermediate_check_seconds=intermediate_check_seconds,
+        active_check_ttl_seconds=active_check_ttl_seconds,
         command_group_id=command_group_id,
         command_author_uuids=command_authors,
         connect_timeout_seconds=_positive_number(data, "connect_timeout_seconds", 5.0),

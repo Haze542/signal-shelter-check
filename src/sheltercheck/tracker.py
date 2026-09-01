@@ -7,19 +7,31 @@ from collections.abc import Callable
 
 from .config import Config, normalize_text
 from .database import StateDatabase
-from .models import MessageEvent, NormalizedEvent, ReactionEvent
-from .reporter import ReportPublisher, report_for_alarm
+from .models import (
+    AlarmSession,
+    ForceCheckResult,
+    MessageEvent,
+    NormalizedEvent,
+    ObservedMessage,
+    ReactionEvent,
+)
+from .outgoing import OutgoingAttemptResult, attempt_outgoing_once
 from .released_list import ReleasedListError, ReleasedListService
+from .reporter import (
+    ReportPublisher,
+    completion_report_for_alarm,
+    current_report_for_alarm,
+    intermediate_report_for_alarm,
+    report_for_alarm,
+)
 from .roster import Roster, RosterError
-from .signal_client import SignalRPCError
 
 
 LOGGER = logging.getLogger(__name__)
-_RPC_RETRY_MS = 5_000
 
 
 class AlertTracker:
-    """Persistent alert state machine, independent of raw Signal JSON and HTTP."""
+    """Serialized, persistent shelter-check state machine."""
 
     def __init__(
         self,
@@ -38,7 +50,6 @@ class AlertTracker:
         self.released_list = released_list or ReleasedListService(config.released_file)
         self._clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
         self._lock = asyncio.Lock()
-        self._initial_retry_after: dict[int, int] = {}
 
     async def handle_event(self, event: NormalizedEvent) -> None:
         async with self._lock:
@@ -51,15 +62,79 @@ class AlertTracker:
         async with self._lock:
             await self._process_due_locked(self._clock_ms() if now_ms is None else now_ms)
 
+    async def force_check_latest(self) -> ForceCheckResult:
+        async with self._lock:
+            now_ms = self._clock_ms()
+            await self._expire_due(now_ms)
+            alarm = self.database.latest_standard_alarm()
+            if alarm is None:
+                return ForceCheckResult("no_standard")
+            return await self._force_alarm(alarm, now_ms, created=False)
+
+    async def force_check_message(self, text: str) -> ForceCheckResult:
+        async with self._lock:
+            now_ms = self._clock_ms()
+            await self._expire_due(now_ms)
+            self.database.cleanup_observed_history(now_ms)
+            observed = self.database.find_latest_observed_message(
+                group_id=self.config.monitor_group_id,
+                normalized_text=normalize_text(text),
+                allowed_authors=tuple(self.config.trigger_author_uuids),
+            )
+            if observed is None:
+                return ForceCheckResult("message_not_found")
+
+            alarm = self.database.get_alarm_by_identity(
+                observed.group_id,
+                observed.sender_aci,
+                observed.sent_timestamp_ms,
+            )
+            created = False
+            if alarm is None:
+                alarm = await self._create_alarm(
+                    group_id=observed.group_id,
+                    trigger_author_aci=observed.sender_aci,
+                    trigger_timestamp_ms=observed.sent_timestamp_ms,
+                    tracking_started_at_ms=now_ms,
+                    source="custom",
+                )
+                if alarm is None:
+                    alarm = self.database.get_alarm_by_identity(
+                        observed.group_id,
+                        observed.sender_aci,
+                        observed.sent_timestamp_ms,
+                    )
+                else:
+                    created = True
+                    await self._replay_observed_reactions(alarm, observed, now_ms)
+                    alarm = self.database.get_alarm(alarm.id)
+            if alarm is None:
+                return ForceCheckResult("message_not_found")
+            return await self._force_alarm(alarm, now_ms, created=created)
+
+    def _trigger_author_allowed(self, aci: str) -> bool:
+        return (
+            not self.config.trigger_author_uuids
+            or aci in self.config.trigger_author_uuids
+        )
+
     async def _handle_message(self, event: MessageEvent) -> None:
         if event.group_id != self.config.monitor_group_id:
             return
-        if (
-            self.config.trigger_author_uuids
-            and event.sender_aci not in self.config.trigger_author_uuids
-        ):
+        if not self._trigger_author_allowed(event.sender_aci):
             return
-        if normalize_text(event.text) not in self.config.trigger_texts:
+
+        normalized = normalize_text(event.text)
+        self.database.observe_message(
+            group_id=event.group_id,
+            sender_aci=event.sender_aci,
+            sent_timestamp_ms=event.sent_timestamp_ms,
+            original_text=event.text,
+            normalized_text=normalized,
+        )
+        now_ms = self._clock_ms()
+        self.database.cleanup_observed_history(now_ms)
+        if normalized not in self.config.trigger_texts:
             return
 
         existing = self.database.get_alarm_by_identity(
@@ -67,56 +142,102 @@ class AlertTracker:
         )
         if existing is not None:
             return
+        alarm = await self._create_alarm(
+            group_id=event.group_id,
+            trigger_author_aci=event.sender_aci,
+            trigger_timestamp_ms=event.sent_timestamp_ms,
+            tracking_started_at_ms=event.sent_timestamp_ms,
+            source="standard",
+        )
+        if alarm is None:
+            return
+        if alarm.status == "expired":
+            LOGGER.info(
+                "Created already-expired alert %s without outgoing work",
+                event.sent_timestamp_ms,
+            )
+            return
+        LOGGER.info(
+            "Created standard alert %s with %d released members",
+            event.sent_timestamp_ms,
+            len(alarm.released_members),
+        )
+        if not alarm.missing_members:
+            await self._complete_alarm(alarm.id, now_ms)
 
-        deadline = event.sent_timestamp_ms + self.config.wait_milliseconds
+    async def _create_alarm(
+        self,
+        *,
+        group_id: str,
+        trigger_author_aci: str,
+        trigger_timestamp_ms: int,
+        tracking_started_at_ms: int,
+        source: str,
+    ) -> AlarmSession | None:
         now_ms = self._clock_ms()
+        intermediate = (
+            tracking_started_at_ms + self.config.intermediate_check_milliseconds
+        )
+        final = tracking_started_at_ms + self.config.wait_milliseconds
+        expires = tracking_started_at_ms + self.config.active_check_ttl_milliseconds
         try:
             released = await self.released_list.get_members(self.roster)
         except (ReleasedListError, RosterError) as exc:
-            self.database.create_alarm(
-                group_id=event.group_id,
-                trigger_author_aci=event.sender_aci,
-                trigger_timestamp_ms=event.sent_timestamp_ms,
-                deadline_timestamp_ms=deadline,
+            alarm = self.database.create_alarm(
+                group_id=group_id,
+                trigger_author_aci=trigger_author_aci,
+                trigger_timestamp_ms=trigger_timestamp_ms,
+                tracking_started_at_ms=tracking_started_at_ms,
+                intermediate_deadline_timestamp_ms=intermediate,
+                deadline_timestamp_ms=final,
+                expires_timestamp_ms=expires,
                 released_members=(),
+                source=source,
                 status="error",
                 error_detail=str(exc),
                 created_at_ms=now_ms,
             )
             LOGGER.error(
-                "Alert %s cannot produce an authoritative report: released list is invalid: %s",
-                event.sent_timestamp_ms,
+                "Alert %s cannot start: released list is invalid: %s",
+                trigger_timestamp_ms,
                 exc,
             )
-            return
+            return alarm
 
-        status = "stale" if now_ms > deadline else "pending"
-        alarm = self.database.create_alarm(
-            group_id=event.group_id,
-            trigger_author_aci=event.sender_aci,
-            trigger_timestamp_ms=event.sent_timestamp_ms,
-            deadline_timestamp_ms=deadline,
+        status = "expired" if now_ms >= expires else "pending"
+        return self.database.create_alarm(
+            group_id=group_id,
+            trigger_author_aci=trigger_author_aci,
+            trigger_timestamp_ms=trigger_timestamp_ms,
+            tracking_started_at_ms=tracking_started_at_ms,
+            intermediate_deadline_timestamp_ms=intermediate,
+            deadline_timestamp_ms=final,
+            expires_timestamp_ms=expires,
             released_members=released,
+            source=source,
             status=status,
             created_at_ms=now_ms,
         )
-        if alarm is None:
-            return
-        if status == "stale":
-            LOGGER.error(
-                "Skipping stale alert %s: its deadline passed before the trigger was processed",
-                event.sent_timestamp_ms,
-            )
-        else:
-            LOGGER.info(
-                "Created alert %s with %d released members",
-                event.sent_timestamp_ms,
-                len(released),
-            )
 
     async def _handle_reaction(self, event: ReactionEvent) -> None:
+        if event.group_id != self.config.monitor_group_id:
+            return
         if event.emoji not in self.config.accepted_reactions:
             return
+        if (
+            event.target_author_aci is not None
+            and not self._trigger_author_allowed(event.target_author_aci)
+        ):
+            return
+
+        observed = self.database.resolve_observed_reaction_target(
+            group_id=event.group_id,
+            target_timestamp_ms=event.target_timestamp_ms,
+            target_author_aci=event.target_author_aci,
+        )
+        if observed is not None and self._trigger_author_allowed(observed.sender_aci):
+            self.database.observe_reaction(target=observed, event=event)
+
         targets = self.database.find_active_reaction_targets(
             group_id=event.group_id,
             trigger_timestamp_ms=event.target_timestamp_ms,
@@ -132,16 +253,27 @@ class AlertTracker:
             return
 
         now_ms = self._clock_ms()
+        await self._expire_due(now_ms)
         for target in targets:
-            # Preserve the deadline boundary if event-loop scheduling delayed both the
-            # report tick and this reaction. Timely reactions enter the initial report;
-            # reactions sent after the deadline first produce, then edit, that report.
+            refreshed = self.database.get_alarm(target.id)
+            if not refreshed.is_active:
+                continue
+
+            # Preserve event-time deadline semantics if both a ticker and a reaction
+            # were delayed: a reaction sent after a deadline cannot enter that report.
             if (
-                target.status == "pending"
-                and target.deadline_timestamp_ms <= now_ms
-                and event.sent_timestamp_ms > target.deadline_timestamp_ms
+                refreshed.status == "pending"
+                and now_ms >= refreshed.deadline_timestamp_ms
+                and event.sent_timestamp_ms > refreshed.deadline_timestamp_ms
             ):
-                await self._send_initial(target.id, now_ms)
+                await self._process_final(refreshed.id, now_ms)
+            elif (
+                refreshed.status == "pending"
+                and now_ms >= refreshed.intermediate_deadline_timestamp_ms
+                and now_ms < refreshed.deadline_timestamp_ms
+                and event.sent_timestamp_ms > refreshed.intermediate_deadline_timestamp_ms
+            ):
+                await self._process_intermediate(refreshed.id, now_ms)
 
             changed = self.database.apply_reaction(
                 alarm_id=target.id,
@@ -153,91 +285,327 @@ class AlertTracker:
                 now_ms=now_ms,
                 debounce_ms=self.config.edit_debounce_milliseconds,
             )
+            refreshed = self.database.get_alarm(target.id)
             if changed:
                 LOGGER.info(
                     "Alert %s response state changed for roster ACI",
-                    target.trigger_timestamp_ms,
+                    refreshed.trigger_timestamp_ms,
                 )
-
-            refreshed = self.database.get_alarm(target.id)
-            if (
+            if not refreshed.is_active:
+                continue
+            if changed and not event.removed and not refreshed.missing_members:
+                await self._complete_alarm(refreshed.id, now_ms)
+                continue
+            if refreshed.status == "pending" and now_ms >= refreshed.deadline_timestamp_ms:
+                await self._process_final(refreshed.id, now_ms)
+            elif (
                 refreshed.status == "pending"
-                and refreshed.deadline_timestamp_ms <= now_ms
-                and event.sent_timestamp_ms <= refreshed.deadline_timestamp_ms
+                and now_ms >= refreshed.intermediate_deadline_timestamp_ms
             ):
-                await self._send_initial(refreshed.id, now_ms)
+                await self._process_intermediate(refreshed.id, now_ms)
+
+    async def _replay_observed_reactions(
+        self,
+        alarm: AlarmSession,
+        observed: ObservedMessage,
+        now_ms: int,
+    ) -> None:
+        for event in self.database.list_observed_reactions(observed):
+            self.database.apply_reaction(
+                alarm_id=alarm.id,
+                reactor_aci=event.reactor_aci,
+                responded=not event.removed,
+                event_timestamp_ms=event.sent_timestamp_ms,
+                emoji=event.emoji,
+                removed=event.removed,
+                now_ms=now_ms,
+                debounce_ms=self.config.edit_debounce_milliseconds,
+            )
 
     async def _process_due_locked(self, now_ms: int) -> None:
-        for alarm in self.database.list_due_initial_reports(now_ms):
-            await self._send_initial(alarm.id, now_ms)
+        # Strict priority: a TTL-expired alarm performs no Signal operation.
+        await self._expire_due(now_ms)
+
+        # Recover a completion transition whose reaction state committed before a
+        # crash. Existing durable operation claims make this restart-safe.
+        for alarm in self.database.list_alarms():
+            if alarm.is_active and not alarm.missing_members:
+                await self._complete_alarm(alarm.id, now_ms)
+
+        for alarm in self.database.list_due_intermediate(now_ms):
+            await self._process_intermediate(alarm.id, now_ms)
+
+        for alarm in self.database.list_due_final(now_ms):
+            await self._process_final(alarm.id, now_ms)
 
         for alarm in self.database.list_due_edits(now_ms):
-            refreshed = self.database.get_alarm(alarm.id)
-            text = report_for_alarm(refreshed)
-            if text == refreshed.last_report_text:
-                self.database.complete_edit(
-                    refreshed.id, text, len(refreshed.missing_members)
-                )
-                continue
-            if refreshed.report_message_timestamp_ms is None:
-                LOGGER.error(
-                    "Alert %s has no report timestamp; edit cannot be sent",
-                    refreshed.trigger_timestamp_ms,
-                )
-                self.database.defer_edit(refreshed.id, now_ms + _RPC_RETRY_MS)
-                continue
-            try:
-                await self.publisher.edit(text, refreshed.report_message_timestamp_ms)
-            except Exception as exc:  # edits are idempotent and safe to retry
-                LOGGER.error(
-                    "Could not edit report for alert %s; retrying later: %s",
-                    refreshed.trigger_timestamp_ms,
-                    exc,
-                )
-                self.database.defer_edit(refreshed.id, now_ms + _RPC_RETRY_MS)
-                continue
-            self.database.complete_edit(
-                refreshed.id, text, len(refreshed.missing_members)
-            )
-            LOGGER.info("Edited report for alert %s", refreshed.trigger_timestamp_ms)
+            await self._process_edit(alarm.id, now_ms)
 
-    async def _send_initial(self, alarm_id: int, now_ms: int) -> None:
-        if self._initial_retry_after.get(alarm_id, 0) > now_ms:
-            return
+        removed = self.database.cleanup_observed_history(now_ms)
+        if removed:
+            LOGGER.info("Removed %d expired observed Signal candidate message(s)", removed)
+
+    async def _expire_due(self, now_ms: int) -> None:
+        for alarm in self.database.expire_due_alarms(now_ms):
+            LOGGER.info(
+                "Silently expired alert %s at its active-check TTL",
+                alarm.trigger_timestamp_ms,
+            )
+
+    async def _process_intermediate(self, alarm_id: int, now_ms: int) -> None:
         alarm = self.database.get_alarm(alarm_id)
-        if alarm.status != "pending" or alarm.initial_report_state != 0:
+        key = self.database.alarm_operation_key(alarm.id, "intermediate")
+        if alarm.status != "pending":
+            self.database.skip_outgoing(key, now_ms=now_ms, reason="alarm is not pending")
             return
-        alarm = self.database.snapshot_initial_missing(alarm.id)
-        text = report_for_alarm(alarm)
-        if not self.database.begin_initial_report(alarm.id, text):
+        if now_ms >= alarm.expires_timestamp_ms:
+            await self._expire_due(now_ms)
             return
-        try:
-            report_timestamp = await self.publisher.send(text)
-        except SignalRPCError as exc:
-            # A complete JSON-RPC rejection is known not to be a successful send.
-            self.database.release_initial_report(alarm.id)
-            self._initial_retry_after[alarm.id] = now_ms + _RPC_RETRY_MS
-            LOGGER.error(
-                "Signal rejected initial report for alert %s; retrying later: %s",
-                alarm.trigger_timestamp_ms,
-                exc,
+        if now_ms >= alarm.deadline_timestamp_ms:
+            self.database.skip_outgoing(
+                key,
+                now_ms=now_ms,
+                reason="final deadline already passed",
             )
             return
-        except Exception as exc:
-            # HTTP disconnects/timeouts are ambiguous: the daemon might have accepted
-            # the message. Keep the durable claim so restart cannot duplicate it.
-            LOGGER.critical(
-                "Initial report send for alert %s is uncertain; refusing automatic retry to avoid a duplicate: %s",
-                alarm.trigger_timestamp_ms,
-                exc,
-            )
+        if not alarm.missing_members:
+            await self._complete_alarm(alarm.id, now_ms)
             return
 
-        self.database.complete_initial_report(
-            alarm.id,
-            report_timestamp_ms=report_timestamp,
-            report_text=text,
-            missing_count=len(alarm.missing_members),
+        text = intermediate_report_for_alarm(alarm)
+        self.database.mark_outgoing_due(key, message=text, now_ms=now_ms)
+        result = await attempt_outgoing_once(
+            self.database,
+            key,
+            now_ms=now_ms,
+            write=lambda: self.publisher.send(text),
         )
-        self._initial_retry_after.pop(alarm.id, None)
-        LOGGER.info("Sent initial report for alert %s", alarm.trigger_timestamp_ms)
+        self._log_attempt("intermediate report", alarm, result)
+
+    async def _process_final(self, alarm_id: int, now_ms: int) -> None:
+        alarm = self.database.get_alarm(alarm_id)
+        if alarm.status != "pending":
+            return
+        if now_ms >= alarm.expires_timestamp_ms:
+            await self._expire_due(now_ms)
+            return
+        intermediate_key = self.database.alarm_operation_key(alarm.id, "intermediate")
+        self.database.skip_outgoing(
+            intermediate_key,
+            now_ms=now_ms,
+            reason="final evaluation superseded intermediate report",
+        )
+        if not alarm.missing_members:
+            await self._complete_alarm(alarm.id, now_ms)
+            return
+
+        alarm = self.database.snapshot_final_missing(alarm.id)
+        text = report_for_alarm(alarm)
+        key = self.database.alarm_operation_key(alarm.id, "final")
+        self.database.mark_outgoing_due(key, message=text, now_ms=now_ms)
+        result = await attempt_outgoing_once(
+            self.database,
+            key,
+            now_ms=now_ms,
+            write=lambda: self.publisher.send(text),
+        )
+        self.database.mark_reported(
+            alarm.id,
+            operation_state=result.state,
+            report_timestamp_ms=result.result_timestamp_ms,
+            report_text=text,
+        )
+        self._log_attempt("final report", alarm, result)
+
+    async def _process_edit(self, alarm_id: int, now_ms: int) -> None:
+        alarm = self.database.get_alarm(alarm_id)
+        if alarm.status != "reported" or alarm.report_message_timestamp_ms is None:
+            self.database.clear_edit_due(alarm.id)
+            return
+        if not alarm.missing_members:
+            await self._complete_alarm(alarm.id, now_ms)
+            return
+        text = report_for_alarm(alarm)
+        if text == alarm.last_report_text:
+            self.database.clear_edit_due(alarm.id)
+            return
+        key = self.database.alarm_operation_key(
+            alarm.id, f"report_edit:{alarm.reaction_revision}"
+        )
+        self.database.prepare_outgoing(
+            operation_key=key,
+            alarm_id=alarm.id,
+            kind="report_edit",
+            state="due_not_attempted",
+            message=text,
+            target_timestamp_ms=alarm.report_message_timestamp_ms,
+            now_ms=now_ms,
+        )
+
+        async def edit() -> None:
+            await self.publisher.edit(text, alarm.report_message_timestamp_ms)  # type: ignore[arg-type]
+
+        result = await attempt_outgoing_once(
+            self.database,
+            key,
+            now_ms=now_ms,
+            write=edit,
+        )
+        if result.state == "attempted_success":
+            self.database.record_successful_edit(alarm.id, text)
+        else:
+            self.database.clear_edit_due(alarm.id)
+        self._log_attempt("report edit", alarm, result)
+
+    async def _complete_alarm(self, alarm_id: int, now_ms: int) -> None:
+        alarm = self.database.get_alarm(alarm_id)
+        if not alarm.is_active or alarm.missing_members:
+            return
+        text = completion_report_for_alarm(alarm, now_ms)
+        if alarm.status == "reported" and alarm.report_message_timestamp_ms is not None:
+            kind = "completion_edit"
+            key = self.database.alarm_operation_key(alarm.id, kind)
+            self.database.prepare_outgoing(
+                operation_key=key,
+                alarm_id=alarm.id,
+                kind=kind,
+                state="due_not_attempted",
+                message=text,
+                target_timestamp_ms=alarm.report_message_timestamp_ms,
+                now_ms=now_ms,
+            )
+
+            async def edit() -> None:
+                await self.publisher.edit(text, alarm.report_message_timestamp_ms)  # type: ignore[arg-type]
+
+            result = await attempt_outgoing_once(
+                self.database,
+                key,
+                now_ms=now_ms,
+                write=edit,
+            )
+        else:
+            kind = "completion"
+            key = self.database.alarm_operation_key(alarm.id, kind)
+            final_operation = self.database.get_outgoing(
+                self.database.alarm_operation_key(alarm.id, "final")
+            )
+            if (
+                alarm.status == "reported"
+                and final_operation is not None
+                and final_operation.state == "attempted_uncertain"
+            ):
+                # The final message may already exist, but a transport break left no
+                # timestamp that can be edited. A second independent send would risk
+                # a duplicate, so completion is local-only in this narrow case.
+                self.database.prepare_outgoing(
+                    operation_key=key,
+                    alarm_id=alarm.id,
+                    kind=kind,
+                    state="skipped",
+                    message=text,
+                    now_ms=now_ms,
+                )
+                result = OutgoingAttemptResult("skipped", attempted_now=False)
+                self.database.mark_completed(alarm.id, now_ms=now_ms)
+                LOGGER.warning(
+                    "Completed alert %s locally because final delivery was uncertain; "
+                    "no completion send was attempted",
+                    alarm.trigger_timestamp_ms,
+                )
+                return
+            self.database.prepare_outgoing(
+                operation_key=key,
+                alarm_id=alarm.id,
+                kind=kind,
+                state="due_not_attempted",
+                message=text,
+                now_ms=now_ms,
+            )
+            result = await attempt_outgoing_once(
+                self.database,
+                key,
+                now_ms=now_ms,
+                write=lambda: self.publisher.send(text),
+            )
+        self.database.mark_completed(alarm.id, now_ms=now_ms)
+        self._log_attempt(kind, alarm, result)
+        LOGGER.info("Completed alert %s", alarm.trigger_timestamp_ms)
+
+    async def _force_alarm(
+        self, alarm: AlarmSession, now_ms: int, *, created: bool
+    ) -> ForceCheckResult:
+        alarm = self.database.get_alarm(alarm.id)
+        if not alarm.is_active:
+            return ForceCheckResult("terminal", alarm, created=created)
+        if not alarm.missing_members:
+            await self._complete_alarm(alarm.id, now_ms)
+            return ForceCheckResult(
+                "completed", self.database.get_alarm(alarm.id), created=created
+            )
+        if alarm.status == "pending" and now_ms >= alarm.deadline_timestamp_ms:
+            await self._process_final(alarm.id, now_ms)
+            refreshed = self.database.get_alarm(alarm.id)
+            final = self.database.get_outgoing(
+                self.database.alarm_operation_key(alarm.id, "final")
+            )
+            return ForceCheckResult(
+                "evaluated",
+                refreshed,
+                created=created,
+                outgoing_state=final.state if final is not None else None,
+            )
+
+        text = current_report_for_alarm(alarm)
+        key = self.database.alarm_operation_key(alarm.id, "manual_report")
+        self.database.prepare_outgoing(
+            operation_key=key,
+            alarm_id=alarm.id,
+            kind="manual_report",
+            state="due_not_attempted",
+            message=text,
+            now_ms=now_ms,
+        )
+        result = await attempt_outgoing_once(
+            self.database,
+            key,
+            now_ms=now_ms,
+            write=lambda: self.publisher.send(text),
+        )
+        self._log_attempt("manual report", alarm, result)
+        return ForceCheckResult(
+            "evaluated",
+            self.database.get_alarm(alarm.id),
+            created=created,
+            outgoing_state=result.state,
+        )
+
+    @staticmethod
+    def _log_attempt(
+        operation: str, alarm: AlarmSession, result: OutgoingAttemptResult
+    ) -> None:
+        if not result.attempted_now and result.state != "skipped":
+            return
+        if result.state == "attempted_success":
+            LOGGER.info("Sent %s for alert %s", operation, alarm.trigger_timestamp_ms)
+        elif result.state == "attempted_failed":
+            LOGGER.error(
+                "%s for alert %s failed explicitly and will not be retried: %s",
+                operation,
+                alarm.trigger_timestamp_ms,
+                result.error,
+            )
+        elif result.state == "attempted_uncertain":
+            LOGGER.critical(
+                "%s for alert %s has uncertain delivery and will not be retried: %s",
+                operation,
+                alarm.trigger_timestamp_ms,
+                result.error,
+            )
+        elif result.state == "skipped":
+            LOGGER.error(
+                "%s for alert %s was blocked before RPC: %s",
+                operation,
+                alarm.trigger_timestamp_ms,
+                result.error,
+            )

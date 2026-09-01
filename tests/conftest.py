@@ -47,6 +47,8 @@ def app_config(tmp_path: Path, members: tuple[Member, ...]) -> Config:
         trigger_author_uuids=frozenset({AUTHOR}),
         accepted_reactions=frozenset({"➕"}),
         wait_seconds=10,
+        intermediate_check_seconds=5,
+        active_check_ttl_seconds=60,
         state_db=tmp_path / "state.sqlite3",
         roster_file=tmp_path / "roster.csv",
         released_file=released,

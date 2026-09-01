@@ -9,6 +9,39 @@ from .models import AlarmSession, Member
 from .signal_client import SignalClient
 
 
+def format_duration(total_seconds: int) -> str:
+    """Compact Ukrainian duration used by completion, status, and uptime."""
+
+    total_seconds = max(0, int(total_seconds))
+    days, remainder = divmod(total_seconds, 86_400)
+    hours, remainder = divmod(remainder, 3_600)
+    minutes, seconds = divmod(remainder, 60)
+    if days:
+        parts = [f"{days} д"]
+        if hours:
+            parts.append(f"{hours} год")
+        if minutes:
+            parts.append(f"{minutes} хв")
+        return " ".join(parts)
+    if hours:
+        parts = [f"{hours} год"]
+        if minutes:
+            parts.append(f"{minutes} хв")
+        return " ".join(parts)
+    if minutes:
+        parts = [f"{minutes} хв"]
+        if seconds:
+            parts.append(f"{seconds} с")
+        return " ".join(parts)
+    return f"{seconds} с"
+
+
+def _check_time(trigger_timestamp_ms: int, timezone: tzinfo | None) -> str:
+    return datetime.fromtimestamp(
+        trigger_timestamp_ms / 1000, tz=timezone
+    ).astimezone(timezone).strftime("%H:%M")
+
+
 def format_report(
     trigger_timestamp_ms: int,
     released_members: Sequence[Member],
@@ -17,9 +50,7 @@ def format_report(
     *,
     timezone: tzinfo | None = None,
 ) -> str:
-    check_time = datetime.fromtimestamp(
-        trigger_timestamp_ms / 1000, tz=timezone
-    ).astimezone(timezone).strftime("%H:%M")
+    check_time = _check_time(trigger_timestamp_ms, timezone)
     missing = [
         member for member in released_members if member.signal_aci not in responded_acis
     ]
@@ -88,4 +119,51 @@ def report_for_alarm(alarm: AlarmSession, *, timezone: tzinfo | None = None) -> 
         alarm.initial_missing,
         alarm.responded_acis,
         timezone=timezone,
+    )
+
+
+def current_report_for_alarm(
+    alarm: AlarmSession, *, timezone: tzinfo | None = None
+) -> str:
+    return format_report(
+        alarm.trigger_timestamp_ms,
+        alarm.released_members,
+        alarm.missing_members,
+        alarm.responded_acis,
+        timezone=timezone,
+    )
+
+
+def intermediate_report_for_alarm(
+    alarm: AlarmSession, *, timezone: tzinfo | None = None
+) -> str:
+    missing = alarm.missing_members
+    responded = len(alarm.released_members) - len(missing)
+    lines = [
+        f"Проміжна перевірка {_check_time(alarm.trigger_timestamp_ms, timezone)}",
+        "",
+        f"Відмітилися: {responded}/{len(alarm.released_members)}",
+        f"Очікуються: {len(missing)}",
+    ]
+    if missing:
+        lines.extend(
+            [
+                "",
+                *(
+                    f"{position}. {member.display_name} | {member.phone}"
+                    for position, member in enumerate(missing, 1)
+                ),
+            ]
+        )
+    return "\n".join(lines)
+
+
+def completion_report_for_alarm(alarm: AlarmSession, completed_at_ms: int) -> str:
+    total = len(alarm.released_members)
+    elapsed_seconds = max(
+        0, (completed_at_ms - alarm.tracking_started_at_ms) // 1000
+    )
+    return (
+        f"✅ Усі {total}/{total} відмітилися.\n"
+        f"Перевірку завершено за {format_duration(elapsed_seconds)}."
     )
