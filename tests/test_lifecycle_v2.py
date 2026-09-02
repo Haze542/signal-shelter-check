@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -78,6 +79,7 @@ def test_only_pending_and_reported_are_active(status, active, members) -> None:
 
 
 def test_intermediate_is_once_and_uses_alarm_snapshot(app_config, roster) -> None:
+    assert app_config.intermediate_check_enabled is True
     clock = Clock(TRIGGER_TS)
     database, publisher, tracker = build(app_config, roster, clock)
     try:
@@ -118,6 +120,107 @@ def test_intermediate_survives_restart_without_duplicate(
         assert publisher2.sends == []
     finally:
         database2.close()
+
+
+def test_disabled_intermediate_skips_restart_and_still_runs_final(
+    app_config, roster, tmp_path: Path
+) -> None:
+    config = replace(app_config, intermediate_check_enabled=False)
+    path = tmp_path / "disabled-intermediate.sqlite3"
+    clock = Clock(TRIGGER_TS)
+    database, publisher, tracker = build(config, roster, clock, path)
+    run(tracker.handle_event(trigger()))
+    run(tracker.process_due(TRIGGER_TS + 5_000))
+    run(tracker.process_due(TRIGGER_TS + 5_001))
+
+    intermediate_key = "alarm:1:intermediate"
+    intermediate = database.get_outgoing(intermediate_key)
+    assert publisher.sends == []
+    assert intermediate is not None
+    assert intermediate.state == "not_due"
+    assert intermediate.attempt_count == 0
+
+    # Simulate an intermediate operation prepared before a restart and config change.
+    database.mark_outgoing_due(
+        intermediate_key,
+        message="stale intermediate report",
+        now_ms=TRIGGER_TS + 5_001,
+    )
+    database.close()
+
+    clock.value = TRIGGER_TS + 6_000
+    database2, publisher2, tracker2 = build(config, roster, clock, path)
+    try:
+        run(tracker2.process_due())
+        run(tracker2.handle_event(reaction(ACI_1, sent=clock.value)))
+        run(tracker2.process_due(clock.value + 1))
+        intermediate = database2.get_outgoing(intermediate_key)
+        assert publisher2.sends == []
+        assert intermediate is not None
+        assert intermediate.state == "due_not_attempted"
+        assert intermediate.attempt_count == 0
+
+        run(tracker2.process_due(TRIGGER_TS + 10_000))
+        assert len(publisher2.sends) == 1
+        assert not publisher2.sends[0].startswith("Проміжна перевірка")
+        assert database2.list_alarms()[0].status == "reported"
+        intermediate = database2.get_outgoing(intermediate_key)
+        final = database2.get_outgoing("alarm:1:final")
+        assert intermediate is not None
+        assert intermediate.state == "skipped"
+        assert intermediate.attempt_count == 0
+        assert final is not None
+        assert final.state == "attempted_success"
+        assert final.attempt_count == 1
+    finally:
+        database2.close()
+
+
+def test_disabled_intermediate_still_allows_early_completion(
+    app_config, roster
+) -> None:
+    config = replace(app_config, intermediate_check_enabled=False)
+    clock = Clock(TRIGGER_TS)
+    database, publisher, tracker = build(config, roster, clock)
+    try:
+        run(tracker.handle_event(trigger()))
+        for offset, aci in ((1_000, ACI_1), (2_000, ACI_2), (4_000, ACI_3)):
+            clock.value = TRIGGER_TS + offset
+            run(tracker.handle_event(reaction(aci, sent=clock.value)))
+
+        alarm = database.list_alarms()[0]
+        intermediate = database.get_outgoing("alarm:1:intermediate")
+        completion = database.get_outgoing("alarm:1:completion")
+        final = database.get_outgoing("alarm:1:final")
+        assert alarm.status == "completed"
+        assert publisher.sends == [
+            "✅ Усі 3/3 відмітилися.\nПеревірку завершено за 4 с."
+        ]
+        assert intermediate is not None and intermediate.attempt_count == 0
+        assert completion is not None and completion.attempt_count == 1
+        assert final is not None and final.attempt_count == 0
+    finally:
+        database.close()
+
+
+def test_disabled_intermediate_still_honors_ttl(app_config, roster) -> None:
+    config = replace(app_config, intermediate_check_enabled=False)
+    clock = Clock(TRIGGER_TS)
+    database, publisher, tracker = build(config, roster, clock)
+    try:
+        run(tracker.handle_event(trigger()))
+        run(tracker.process_due(TRIGGER_TS + 60_000))
+
+        alarm = database.list_alarms()[0]
+        intermediate = database.get_outgoing("alarm:1:intermediate")
+        final = database.get_outgoing("alarm:1:final")
+        assert alarm.status == "expired"
+        assert publisher.sends == []
+        assert publisher.edits == []
+        assert intermediate is not None and intermediate.attempt_count == 0
+        assert final is not None and final.attempt_count == 0
+    finally:
+        database.close()
 
 
 def test_final_deadline_skips_late_intermediate(app_config, roster) -> None:

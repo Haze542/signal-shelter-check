@@ -4,13 +4,13 @@ ShelterCheck автоматично контролює перевірки в Sig
 
 1. бачить повідомлення «Всі в укритті?»;
 2. фіксує snapshot звільнених і перевіряє reactions `➕` саме для нього;
-3. через заданий час, наприклад 5 хвилин, надсилає проміжний звіт;
+3. якщо проміжний звіт увімкнено, через заданий час, наприклад 5 хвилин, надсилає його;
 4. у final deadline, наприклад через 10 хвилин, надсилає authoritative звіт;
 5. завершує перевірку одразу після `N/N`, не чекаючи наступного deadline;
 6. старі активні перевірки silent-expire за TTL, типово через 6 годин.
 
-Програма також дозволяє авторизованому сержанту керувати списком звільнених
-через команди Signal.
+Програма також дозволяє авторизованим користувачам команд керувати списком
+звільнених через Signal.
 
 ## Швидкий старт
 
@@ -147,7 +147,7 @@ trigger_author_uuids = [
 ]
 
 command_author_uuids = [
-    "ACI_UUID_СЕРЖАНТА"
+    "ACI_UUID_АВТОРИЗОВАНОГО_КОРИСТУВАЧА_КОМАНД"
 ]
 ```
 
@@ -166,20 +166,53 @@ state_db = "/var/lib/sheltercheck/state.sqlite3"
 Lifecycle timers:
 
 ```toml
+intermediate_check_enabled = true
 intermediate_check_seconds = 300
 wait_seconds = 600
 active_check_ttl_seconds = 21600
 ```
 
-Це означає: через 5 хвилин — максимум один проміжний report, через 10 хвилин —
-final evaluation, через 6 годин — silent expiry без Signal send/edit. Має виконуватися
-`0 < intermediate_check_seconds < wait_seconds < active_check_ttl_seconds`. Обидва
-нові ключі optional: старий deployed config без них використовує defaults `300` і
-`21600`.
+`intermediate_check_enabled` — optional boolean із default `true`. Старий deployed
+config без цього key зберігає поточну поведінку.
 
-Проміжний report не завершує session і показує current missing snapshot цієї
-перевірки. Final report окремий і authoritative. Completion також має окремий
-короткий формат, наприклад:
+Коли проміжний звіт увімкнений:
+
+```toml
+intermediate_check_enabled = true
+intermediate_check_seconds = 300
+wait_seconds = 600
+```
+
+```text
+5 хв  → проміжний звіт
+10 хв → основна перевірка
+```
+
+У цьому режимі має виконуватися
+`0 < intermediate_check_seconds < wait_seconds < active_check_ttl_seconds`.
+Проміжний report надсилається максимум один раз, не завершує session і показує
+current missing snapshot цієї перевірки.
+
+Щоб повністю пропустити проміжний звіт:
+
+```toml
+intermediate_check_enabled = false
+wait_seconds = 600
+```
+
+```text
+10 хв → основна перевірка
+```
+
+При `false` проміжне повідомлення та send attempt не створюються.
+`intermediate_check_seconds` усе ще має бути positive integer, але не впливає на
+runtime behavior. Early completion після `N/N`, final evaluation за `wait_seconds`
+і silent expiry за `active_check_ttl_seconds` працюють незалежно від цього параметра.
+Без explicit timing keys використовуються defaults `300` для intermediate deadline
+і `21600` для TTL.
+
+Final report окремий і authoritative. Completion також має окремий короткий формат,
+наприклад:
 
 ```text
 ✅ Усі 17/17 відмітилися.
@@ -311,7 +344,7 @@ Released list також можна змінювати дозволеними Si
 | `/delrt` + імена | Видалити людей зі списку. |
 | `/clearrt confirm` | Очистити список; без слова `confirm` очищення не відбудеться. |
 | `/check` | Виконати manual evaluation останньої стандартної перевірки. |
-| `/check <текст>` | Почати або перевірити session для найновішого отриманого повідомлення офіцера з exact normalized text. |
+| `/check <текст>` | Почати або перевірити session для найновішого отриманого повідомлення дозволеного автора з exact normalized text. |
 | `/status` | Показати стан системи, uptime і detail найновішої активної перевірки. |
 | `/help` | Показати коротку довідку. |
 
@@ -328,14 +361,14 @@ substring і regex matching немає.
 ShelterChecker не читає server-side Signal history. Він може знайти тільки message і
 reactions, events яких реально отримав під час роботи. Для цього локально зберігається
 обмежена 24-годинна candidate history тільки для monitor group та дозволених
-officer authors. Add/remove reactions, отримані до `/check <текст>`, replay-яться за
+авторів контрольних повідомлень. Add/remove reactions, отримані до `/check <текст>`, replay-яться за
 event timestamp, тому manual session одразу має правильний current response state.
 
-Для custom session original officer timestamp залишається reaction target і часом
+Для custom session original timestamp релевантного повідомлення залишається reaction target і часом
 «Контрольного повідомлення». `tracking_started_at_ms` фіксується окремо в момент
 `/check <текст>`; intermediate/final/TTL та elapsed рахуються від нього. Snapshot
 released list також фіксується саме в момент запуску manual check, а не в момент
-написання officer message.
+надсилання релевантного повідомлення.
 
 ### Логи, restart і stop
 
@@ -630,8 +663,9 @@ write використовує private temporary file в тому самому f
 
 - `signal-cli` API не можна публікувати через reverse proxy або firewall port-forward;
 - normal logs не містять телефонів або повних command payload;
-- observed history містить лише 24 години candidate messages дозволених officer
-  authors у monitor group та потрібні reaction events; це не архів Signal chat;
+- observed history містить лише 24 години candidate messages дозволених авторів
+  контрольних повідомлень у monitor group та потрібні reaction events; це не архів
+  Signal chat;
 - unit використовує `--scrub-log --no-receive-stdout`;
 - `tools/dump_events.py` може показати personal data й призначений лише для локальної
   діагностики в ignored `debug_events/`;

@@ -332,8 +332,9 @@ class AlertTracker:
             if alarm.is_active and not alarm.missing_members:
                 await self._complete_alarm(alarm.id, now_ms)
 
-        for alarm in self.database.list_due_intermediate(now_ms):
-            await self._process_intermediate(alarm.id, now_ms)
+        if self.config.intermediate_check_enabled:
+            for alarm in self.database.list_due_intermediate(now_ms):
+                await self._process_intermediate(alarm.id, now_ms)
 
         for alarm in self.database.list_due_final(now_ms):
             await self._process_final(alarm.id, now_ms)
@@ -353,6 +354,8 @@ class AlertTracker:
             )
 
     async def _process_intermediate(self, alarm_id: int, now_ms: int) -> None:
+        if not self.config.intermediate_check_enabled:
+            return
         alarm = self.database.get_alarm(alarm_id)
         key = self.database.alarm_operation_key(alarm.id, "intermediate")
         if alarm.status != "pending":

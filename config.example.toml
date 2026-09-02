@@ -19,8 +19,11 @@ accepted_reactions = [
     "➕"
 ]
 
-# 5 min intermediate, 10 min authoritative final, 6 h silent active-check TTL.
+# Optional intermediate status report. Set to false to skip it completely.
+intermediate_check_enabled = true
 intermediate_check_seconds = 300
+
+# 10 min authoritative final, 6 h silent active-check TTL.
 wait_seconds = 600
 active_check_ttl_seconds = 21600
 state_db = "/var/lib/sheltercheck/state.sqlite3"

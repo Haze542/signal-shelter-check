@@ -17,6 +17,7 @@ def test_example_config_is_structurally_valid() -> None:
     config = load_config(root / "config.example.toml", require_groups=False)
     assert config.signal_cli_url == "http://127.0.0.1:8080"
     assert config.wait_seconds == 600
+    assert config.intermediate_check_enabled is True
     assert config.intermediate_check_seconds == 300
     assert config.active_check_ttl_seconds == 21_600
     assert config.command_group_id
@@ -63,6 +64,47 @@ def test_existing_config_without_new_timing_keys_uses_defaults(tmp_path: Path) -
     config = load_config(path, require_groups=False)
     assert config.intermediate_check_seconds == 300
     assert config.active_check_ttl_seconds == 21_600
+
+
+def test_existing_config_without_intermediate_enabled_uses_true(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "config.example.toml").read_text(encoding="utf-8")
+    text = text.replace("intermediate_check_enabled = true\n", "")
+    path = tmp_path / "legacy-intermediate.toml"
+    path.write_text(text, encoding="utf-8")
+
+    config = load_config(path, require_groups=False)
+    assert config.intermediate_check_enabled is True
+
+
+@pytest.mark.parametrize("invalid_value", ['"false"', "0", "1"])
+def test_intermediate_enabled_requires_boolean(
+    tmp_path: Path, invalid_value: str
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "config.example.toml").read_text(encoding="utf-8")
+    text = text.replace(
+        "intermediate_check_enabled = true",
+        f"intermediate_check_enabled = {invalid_value}",
+    )
+    path = tmp_path / "bad-intermediate-enabled.toml"
+    path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="intermediate_check_enabled must be a boolean"):
+        load_config(path, require_groups=False)
+
+
+def test_disabled_intermediate_does_not_constrain_final_deadline(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "config.example.toml").read_text(encoding="utf-8")
+    text = text.replace("intermediate_check_enabled = true", "intermediate_check_enabled = false")
+    text = text.replace("intermediate_check_seconds = 300", "intermediate_check_seconds = 600")
+    path = tmp_path / "disabled-intermediate.toml"
+    path.write_text(text, encoding="utf-8")
+
+    config = load_config(path, require_groups=False)
+    assert config.intermediate_check_enabled is False
+    assert config.intermediate_check_seconds == config.wait_seconds
 
 
 @pytest.mark.parametrize(
