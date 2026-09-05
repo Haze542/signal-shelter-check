@@ -12,10 +12,10 @@ ShelterCheck автоматично контролює перевірки в Sig
 Програма також дозволяє авторизованим користувачам команд керувати списком
 звільнених через Signal.
 
-Поточна версія — **v0.2.3**. У ній `/check <текст>` може вибрати повідомлення
-будь-якого автора, автоматична reaction host-акаунта стала configurable, а
-готовність signal-cli означає не лише відкритий HTTP port, а й рівно один
-завантажений account.
+Поточна версія — **v0.2.4**. Після кожного запуску process автоматично обробляються
+лише перевірки, original Signal timestamp яких не старший за runtime startup
+boundary. Backlog до restart не створює session і не надсилає report, але лишається
+доступним авторизованим `/check` і `/check <текст>`.
 
 ## Швидкий старт
 
@@ -363,8 +363,11 @@ Released list також можна змінювати дозволеними Si
 | `/status` | Показати стан системи, uptime і detail найновішої активної перевірки. |
 | `/help` | Показати коротку довідку. |
 
-`/check` не створює новий AlarmSession і не скидає trigger time, intermediate,
-final або TTL останньої standard-перевірки. Якщо вона terminal, новий report не
+`/check` повторно використовує останній AlarmSession і не скидає його trigger time,
+intermediate, final або TTL. Якщо останній standard trigger був отриманий із
+pre-start backlog і тому не має automatic AlarmSession, команда може створити для
+нього manual session: original Signal timestamp лишається reaction target, а timers
+починаються в момент команди. Якщо знайдена session terminal, новий report не
 створюється.
 
 `/check <текст>` потрібна для нестандартного контрольного повідомлення, якого немає
@@ -402,6 +405,13 @@ journalctl -u signal-cli.service -f
 ```bash
 sudo systemctl restart sheltercheck.service
 ```
+
+Кожний запуск нового ShelterCheck process, включно з `systemctl restart` і запуском
+після reboot, створює нову неперсистентну startup boundary. Automatic processing не
+створює, не відновлює, не завершує й не показує в `Active checks` sessions, що
+почалися раніше. Їхні historical rows у SQLite не видаляються; manual `/check` може
+перевірити їх за чинними правилами. Reconnect до signal-cli всередині того самого
+process boundary не змінює.
 
 Зупинити систему:
 
@@ -651,6 +661,13 @@ reports та silent-переводить `pending/reported` у `expired`.
 display time. `tracking_started_at_ms` — початок timer lifecycle. Для automatic
 standard alarm вони однакові; для custom `/check <текст>` tracking починається в
 момент команди.
+
+На старті process ShelterCheck один раз фіксує wall-clock epoch у мілісекундах.
+Automatic trigger допускається лише коли `trigger_timestamp_ms` не менший за цю
+boundary; порівняння не використовує local timezone або час доставки backlog через
+SSE. Automatic deadline, reaction та `/status` active-selection використовують ту
+саму boundary за `tracking_started_at_ms`. Manual `/check` lookup її навмисно не
+застосовує.
 
 Кожна logical outgoing operation записується у SQLite до Signal RPC зі станом, що
 розрізняє `not_due`, `due_not_attempted`, success, explicit failure, uncertain

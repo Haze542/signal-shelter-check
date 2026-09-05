@@ -59,6 +59,8 @@ def build_handler(app_config, roster):
         publisher,
         database,
         signal_health_check=healthy,
+        clock_ms=Clock(TRIGGER_TS),
+        service_started_at_ms=TRIGGER_TS,
     )
     return database, service, publisher, handler
 

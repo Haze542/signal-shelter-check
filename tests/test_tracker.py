@@ -385,7 +385,7 @@ def test_restart_does_not_duplicate_initial_report(app_config, roster, tmp_path:
         database2.close()
 
 
-def test_restart_preserves_initial_missing_statuses_and_report_timestamp(
+def test_restart_preserves_report_state_without_automatic_reaction_edit(
     app_config, roster, tmp_path: Path
 ) -> None:
     db_path = tmp_path / "persistent-state.sqlite3"
@@ -416,9 +416,10 @@ def test_restart_preserves_initial_missing_statuses_and_report_timestamp(
         )
         run(tracker2.process_due(clock.value + 1_000))
         assert publisher2.sends == []
-        assert publisher2.edits[-1][0] == report_timestamp
-        assert "🔴 | Петренко П.П | +380502222222" in publisher2.edits[-1][1]
-        assert "🔴 | Коваль А.А | +380503333333" in publisher2.edits[-1][1]
+        assert publisher2.edits == []
+        assert database2.list_alarms()[0].responded_acis == frozenset(
+            {ACI_1, ACI_2}
+        )
     finally:
         database2.close()
 
@@ -557,17 +558,18 @@ def test_invalid_released_file_records_error_without_report(app_config, roster) 
         database.close()
 
 
-def test_late_trigger_before_ttl_runs_only_final_evaluation(app_config, roster) -> None:
+def test_trigger_sent_before_tracker_start_is_not_automatically_created(
+    app_config, roster
+) -> None:
     clock = Clock(TRIGGER_TS + 10_001)
     database, publisher, tracker = build(app_config, roster, clock)
     try:
         run(tracker.handle_event(trigger()))
-        alarm = database.list_alarms()[0]
-        assert alarm.status == "pending"
-        assert len(alarm.released_members) == 3
         run(tracker.process_due())
-        assert len(publisher.sends) == 1
-        assert database.list_alarms()[0].status == "reported"
+        assert database.list_alarms() == ()
+        assert database.observed_message_count() == 1
+        assert publisher.sends == []
+        assert publisher.reactions == []
     finally:
         database.close()
 

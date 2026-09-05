@@ -447,21 +447,48 @@ class StateDatabase:
         ).fetchall()
         return tuple(self._hydrate(row) for row in rows)
 
-    def count_active_alarms(self) -> int:
-        row = self._connection.execute(
-            "SELECT COUNT(*) AS count FROM alarms WHERE status IN ('pending', 'reported')"
-        ).fetchone()
-        return int(row["count"])
-
-    def latest_active_alarm(self) -> AlarmSession | None:
-        row = self._connection.execute(
-            """
+    def list_active_alarms(
+        self, *, started_at_or_after_ms: int | None = None
+    ) -> tuple[AlarmSession, ...]:
+        sql = """
             SELECT * FROM alarms
             WHERE status IN ('pending', 'reported')
-            ORDER BY tracking_started_at_ms DESC, id DESC
-            LIMIT 1
-            """
-        ).fetchone()
+        """
+        params: list[object] = []
+        if started_at_or_after_ms is not None:
+            sql += " AND tracking_started_at_ms >= ?"
+            params.append(started_at_or_after_ms)
+        sql += " ORDER BY tracking_started_at_ms, id"
+        rows = self._connection.execute(sql, params).fetchall()
+        return tuple(self._hydrate(row) for row in rows)
+
+    def count_active_alarms(
+        self, *, started_at_or_after_ms: int | None = None
+    ) -> int:
+        sql = """
+            SELECT COUNT(*) AS count FROM alarms
+            WHERE status IN ('pending', 'reported')
+        """
+        params: list[object] = []
+        if started_at_or_after_ms is not None:
+            sql += " AND tracking_started_at_ms >= ?"
+            params.append(started_at_or_after_ms)
+        row = self._connection.execute(sql, params).fetchone()
+        return int(row["count"])
+
+    def latest_active_alarm(
+        self, *, started_at_or_after_ms: int | None = None
+    ) -> AlarmSession | None:
+        sql = """
+            SELECT * FROM alarms
+            WHERE status IN ('pending', 'reported')
+        """
+        params: list[object] = []
+        if started_at_or_after_ms is not None:
+            sql += " AND tracking_started_at_ms >= ?"
+            params.append(started_at_or_after_ms)
+        sql += " ORDER BY tracking_started_at_ms DESC, id DESC LIMIT 1"
+        row = self._connection.execute(sql, params).fetchone()
         return self._hydrate(row) if row is not None else None
 
     def latest_standard_alarm(self) -> AlarmSession | None:
@@ -486,6 +513,7 @@ class StateDatabase:
         group_id: str,
         trigger_timestamp_ms: int,
         target_author_aci: str | None,
+        started_at_or_after_ms: int | None = None,
     ) -> tuple[AlarmSession, ...]:
         sql = """
             SELECT * FROM alarms
@@ -493,6 +521,9 @@ class StateDatabase:
               AND status IN ('pending', 'reported')
         """
         params: list[object] = [group_id, trigger_timestamp_ms]
+        if started_at_or_after_ms is not None:
+            sql += " AND tracking_started_at_ms >= ?"
+            params.append(started_at_or_after_ms)
         if target_author_aci is not None:
             sql += " AND trigger_author_aci = ?"
             params.append(target_author_aci)
@@ -632,59 +663,75 @@ class StateDatabase:
                 )
             return changed
 
-    def list_due_intermediate(self, now_ms: int) -> tuple[AlarmSession, ...]:
-        rows = self._connection.execute(
-            """
+    def list_due_intermediate(
+        self, now_ms: int, *, started_at_or_after_ms: int | None = None
+    ) -> tuple[AlarmSession, ...]:
+        sql = """
             SELECT alarm.* FROM alarms AS alarm
             JOIN outgoing_operations AS operation
               ON operation.operation_key = 'alarm:' || alarm.id || ':intermediate'
             WHERE alarm.status = 'pending'
               AND alarm.intermediate_deadline_timestamp_ms <= ?
               AND operation.state = 'not_due'
-            ORDER BY alarm.intermediate_deadline_timestamp_ms, alarm.id
-            """,
-            (now_ms,),
-        ).fetchall()
+        """
+        params: list[object] = [now_ms]
+        if started_at_or_after_ms is not None:
+            sql += " AND alarm.tracking_started_at_ms >= ?"
+            params.append(started_at_or_after_ms)
+        sql += " ORDER BY alarm.intermediate_deadline_timestamp_ms, alarm.id"
+        rows = self._connection.execute(sql, params).fetchall()
         return tuple(self._hydrate(row) for row in rows)
 
-    def list_due_final(self, now_ms: int) -> tuple[AlarmSession, ...]:
-        rows = self._connection.execute(
-            """
+    def list_due_final(
+        self, now_ms: int, *, started_at_or_after_ms: int | None = None
+    ) -> tuple[AlarmSession, ...]:
+        sql = """
             SELECT alarm.* FROM alarms AS alarm
             JOIN outgoing_operations AS operation
               ON operation.operation_key = 'alarm:' || alarm.id || ':final'
             WHERE alarm.status = 'pending'
               AND alarm.deadline_timestamp_ms <= ?
               AND operation.state = 'not_due'
-            ORDER BY alarm.deadline_timestamp_ms, alarm.id
-            """,
-            (now_ms,),
-        ).fetchall()
+        """
+        params: list[object] = [now_ms]
+        if started_at_or_after_ms is not None:
+            sql += " AND alarm.tracking_started_at_ms >= ?"
+            params.append(started_at_or_after_ms)
+        sql += " ORDER BY alarm.deadline_timestamp_ms, alarm.id"
+        rows = self._connection.execute(sql, params).fetchall()
         return tuple(self._hydrate(row) for row in rows)
 
-    def list_due_edits(self, now_ms: int) -> tuple[AlarmSession, ...]:
-        rows = self._connection.execute(
-            """
+    def list_due_edits(
+        self, now_ms: int, *, started_at_or_after_ms: int | None = None
+    ) -> tuple[AlarmSession, ...]:
+        sql = """
             SELECT * FROM alarms
             WHERE status = 'reported'
               AND report_message_timestamp_ms IS NOT NULL
               AND edit_due_timestamp_ms IS NOT NULL
               AND edit_due_timestamp_ms <= ?
-            ORDER BY edit_due_timestamp_ms, id
-            """,
-            (now_ms,),
-        ).fetchall()
+        """
+        params: list[object] = [now_ms]
+        if started_at_or_after_ms is not None:
+            sql += " AND tracking_started_at_ms >= ?"
+            params.append(started_at_or_after_ms)
+        sql += " ORDER BY edit_due_timestamp_ms, id"
+        rows = self._connection.execute(sql, params).fetchall()
         return tuple(self._hydrate(row) for row in rows)
 
-    def expire_due_alarms(self, now_ms: int) -> tuple[AlarmSession, ...]:
-        rows = self._connection.execute(
-            """
+    def expire_due_alarms(
+        self, now_ms: int, *, started_at_or_after_ms: int | None = None
+    ) -> tuple[AlarmSession, ...]:
+        sql = """
             SELECT * FROM alarms
             WHERE status IN ('pending', 'reported') AND expires_timestamp_ms <= ?
-            ORDER BY expires_timestamp_ms, id
-            """,
-            (now_ms,),
-        ).fetchall()
+        """
+        params: list[object] = [now_ms]
+        if started_at_or_after_ms is not None:
+            sql += " AND tracking_started_at_ms >= ?"
+            params.append(started_at_or_after_ms)
+        sql += " ORDER BY expires_timestamp_ms, id"
+        rows = self._connection.execute(sql, params).fetchall()
         alarms = tuple(self._hydrate(row) for row in rows)
         if not alarms:
             return ()
@@ -962,14 +1009,18 @@ class StateDatabase:
         self,
         *,
         group_id: str,
-        normalized_text: str,
+        normalized_texts: Sequence[str],
         allowed_authors: Sequence[str],
     ) -> ObservedMessage | None:
-        sql = """
+        if not normalized_texts:
+            return None
+        text_placeholders = ",".join("?" for _ in normalized_texts)
+        sql = f"""
             SELECT * FROM observed_messages
-            WHERE group_id = ? AND normalized_text = ?
+            WHERE group_id = ?
+              AND normalized_text IN ({text_placeholders})
         """
-        params: list[object] = [group_id, normalized_text]
+        params: list[object] = [group_id, *normalized_texts]
         if allowed_authors:
             placeholders = ",".join("?" for _ in allowed_authors)
             sql += f" AND sender_aci IN ({placeholders})"

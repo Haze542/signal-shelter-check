@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "signal-shelter-check"
-version = "0.2.3"
+version = "0.2.4"
 description = "Track Signal shelter-check reactions through signal-cli"
 readme = "README.md"
 requires-python = ">=3.12"

@@ -86,9 +86,12 @@ async def _run(
     *,
     dry_run: bool,
     process_started_monotonic: float | None = None,
+    service_started_at_ms: int | None = None,
 ) -> None:
     if process_started_monotonic is None:
         process_started_monotonic = time.monotonic()
+    if service_started_at_ms is None:
+        service_started_at_ms = time.time_ns() // 1_000_000
     roster = load_roster(config.roster_file)
     database = StateDatabase(":memory:" if dry_run else config.state_db)
     released_list = ReleasedListService(config.released_file, in_memory=dry_run)
@@ -106,6 +109,7 @@ async def _run(
                 database,
                 publisher,
                 released_list=released_list,
+                service_started_at_ms=service_started_at_ms,
             )
 
             async def signal_health_check() -> bool:
@@ -126,6 +130,7 @@ async def _run(
                 signal_health_check=signal_health_check,
                 tracker=tracker,
                 process_started_monotonic=process_started_monotonic,
+                service_started_at_ms=service_started_at_ms,
             )
 
             print(f"Roster: {len(roster)} members")
@@ -163,6 +168,7 @@ async def _run(
 
 
 def main(argv: list[str] | None = None) -> int:
+    service_started_at_ms = time.time_ns() // 1_000_000
     process_started_monotonic = time.monotonic()
     args = _arguments(argv)
     logging.basicConfig(
@@ -198,6 +204,7 @@ def main(argv: list[str] | None = None) -> int:
                 config,
                 dry_run=args.dry_run,
                 process_started_monotonic=process_started_monotonic,
+                service_started_at_ms=service_started_at_ms,
             )
         )
     except KeyboardInterrupt:

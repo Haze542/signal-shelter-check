@@ -93,6 +93,7 @@ class CommandHandler:
         clock_ms: Callable[[], int] | None = None,
         monotonic_clock: Callable[[], float] | None = None,
         process_started_monotonic: float | None = None,
+        service_started_at_ms: int | None = None,
     ) -> None:
         self.config = config
         self.roster = roster
@@ -102,6 +103,11 @@ class CommandHandler:
         self._signal_health_check = signal_health_check
         self._tracker = tracker
         self._clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
+        self._service_started_at_ms = (
+            self._clock_ms()
+            if service_started_at_ms is None
+            else service_started_at_ms
+        )
         self._monotonic_clock = monotonic_clock or time.monotonic
         self._process_started_monotonic = (
             self._monotonic_clock()
@@ -277,12 +283,15 @@ class CommandHandler:
             LOGGER.warning("Signal health check for /status failed: %s", exc)
 
         released_count = len(await self.released_list.get())
+        active_count = self.database.count_active_alarms(
+            started_at_or_after_ms=self._service_started_at_ms
+        )
         lines = [
             "ShelterCheck: 🟢 працює",
             f"Signal: {'🟢 connected' if signal_connected else '🔴 disconnected'}",
             f"Roster: {len(self.roster)}",
             f"Released today: {released_count}",
-            f"Active checks: {self.database.count_active_alarms()}",
+            f"Active checks: {active_count}",
         ]
         last_check = self.database.last_check_timestamp_ms()
         if last_check is not None:
@@ -295,7 +304,9 @@ class CommandHandler:
         )
         lines.append(f"Up time: {format_duration(uptime_seconds)}")
         lines.append("")
-        active = self.database.latest_active_alarm()
+        active = self.database.latest_active_alarm(
+            started_at_or_after_ms=self._service_started_at_ms
+        )
         if active is None:
             lines.append("Перевірка: неактивна")
             return "\n".join(lines)

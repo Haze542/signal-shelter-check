@@ -66,6 +66,32 @@ def test_parses_linked_device_synchronized_group_text() -> None:
     )
 
 
+def test_message_timestamp_is_taken_from_data_not_later_envelope_delivery() -> None:
+    old_message_timestamp = 1_700_000_000_000
+    later_envelope_timestamp = 1_700_014_400_000
+    events = parse_receive_notification(
+        {
+            "method": "receive",
+            "params": {
+                "result": {
+                    "envelope": {
+                        "sourceUuid": "00000000-0000-4000-8000-000000000010",
+                        "timestamp": later_envelope_timestamp,
+                        "dataMessage": {
+                            "timestamp": old_message_timestamp,
+                            "groupInfo": {"groupId": "SYNTHETIC_MONITOR_GROUP_ID"},
+                            "message": "Всі в укритті?",
+                        },
+                    }
+                }
+            },
+        }
+    )
+
+    assert isinstance(events[0], MessageEvent)
+    assert events[0].sent_timestamp_ms == old_message_timestamp
+
+
 def test_ignores_unknown_or_non_receive_payloads() -> None:
     assert parse_receive_notification({"jsonrpc": "2.0", "method": "typing"}) == ()
     assert (

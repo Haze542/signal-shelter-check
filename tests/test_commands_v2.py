@@ -126,6 +126,38 @@ def test_check_command_delegates_standard_and_custom_modes(app_config, roster) -
         database.close()
 
 
+def test_check_commands_can_use_messages_from_before_process_start(
+    app_config, roster
+) -> None:
+    database, _, reports, commands, tracker, handler, wall, _ = build_integrated(
+        app_config, roster
+    )
+    try:
+        old_standard = TRIGGER_TS - 2
+        run(tracker.handle_event(trigger(timestamp=old_standard)))
+        run(handler.handle_event(command("/check")))
+        assert "Перевірку розпочато" in reply(commands)
+        assert database.list_alarms()[0].trigger_timestamp_ms == old_standard
+
+        old_custom = TRIGGER_TS - 1
+        run(
+            tracker.handle_event(
+                MessageEvent(
+                    "monitor-group",
+                    ACI_2,
+                    old_custom,
+                    "Стара нестандартна перевірка",
+                )
+            )
+        )
+        wall.value += 1
+        run(handler.handle_event(command("/check стара нестандартна перевірка")))
+        assert "Перевірку розпочато" in reply(commands)
+        assert len(reports.sends) == 2
+    finally:
+        database.close()
+
+
 def test_check_not_found_reply_does_not_claim_server_history(app_config, roster) -> None:
     database, _, reports, commands, _, handler, _, _ = build_integrated(
         app_config, roster
@@ -273,6 +305,30 @@ def test_status_multiple_active_shows_latest_detail_only(app_config, roster) -> 
         assert "Active checks: 2" in response
         assert "Відмітилися: 1/3" in response
         assert response.count("Перевірка: активна") == 1
+    finally:
+        database.close()
+
+
+def test_status_excludes_active_alarm_from_previous_runtime(app_config, roster) -> None:
+    database, _, _, commands, tracker, handler, _, _ = build_integrated(
+        app_config, roster
+    )
+    try:
+        database.create_alarm(
+            group_id="monitor-group",
+            trigger_author_aci=AUTHOR,
+            trigger_timestamp_ms=TRIGGER_TS - 1,
+            tracking_started_at_ms=TRIGGER_TS - 1,
+            deadline_timestamp_ms=TRIGGER_TS + 10_000,
+            released_members=roster.members,
+            created_at_ms=TRIGGER_TS - 1,
+        )
+        run(tracker.handle_event(trigger(timestamp=TRIGGER_TS)))
+
+        run(handler.handle_event(command("/status")))
+        response = reply(commands)
+        assert "Active checks: 1" in response
+        assert "Перевірка: активна" in response
     finally:
         database.close()
 

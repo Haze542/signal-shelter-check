@@ -42,6 +42,7 @@ class AlertTracker:
         *,
         released_list: ReleasedListService | None = None,
         clock_ms: Callable[[], int] | None = None,
+        service_started_at_ms: int | None = None,
     ) -> None:
         self.config = config
         self.roster = roster
@@ -49,6 +50,11 @@ class AlertTracker:
         self.publisher = publisher
         self.released_list = released_list or ReleasedListService(config.released_file)
         self._clock_ms = clock_ms or (lambda: time.time_ns() // 1_000_000)
+        self.service_started_at_ms = (
+            self._clock_ms()
+            if service_started_at_ms is None
+            else service_started_at_ms
+        )
         self._lock = asyncio.Lock()
 
     async def handle_event(self, event: NormalizedEvent) -> None:
@@ -65,8 +71,19 @@ class AlertTracker:
     async def force_check_latest(self) -> ForceCheckResult:
         async with self._lock:
             now_ms = self._clock_ms()
-            await self._expire_due(now_ms)
+            await self._expire_due(now_ms, include_pre_start=True)
+            self.database.cleanup_observed_history(now_ms)
             alarm = self.database.latest_standard_alarm()
+            observed = self.database.find_latest_observed_message(
+                group_id=self.config.monitor_group_id,
+                normalized_texts=tuple(self.config.trigger_texts),
+                allowed_authors=tuple(self.config.trigger_author_uuids),
+            )
+            if observed is not None and (
+                alarm is None
+                or observed.sent_timestamp_ms >= alarm.trigger_timestamp_ms
+            ):
+                return await self._force_observed_message(observed, now_ms)
             if alarm is None:
                 return ForceCheckResult("no_standard")
             return await self._force_alarm(alarm, now_ms, created=False)
@@ -74,43 +91,48 @@ class AlertTracker:
     async def force_check_message(self, text: str) -> ForceCheckResult:
         async with self._lock:
             now_ms = self._clock_ms()
-            await self._expire_due(now_ms)
+            await self._expire_due(now_ms, include_pre_start=True)
             self.database.cleanup_observed_history(now_ms)
             observed = self.database.find_latest_observed_message(
                 group_id=self.config.monitor_group_id,
-                normalized_text=normalize_text(text),
+                normalized_texts=(normalize_text(text),),
                 allowed_authors=(),
             )
             if observed is None:
                 return ForceCheckResult("message_not_found")
+            return await self._force_observed_message(observed, now_ms)
 
-            alarm = self.database.get_alarm_by_identity(
-                observed.group_id,
-                observed.sender_aci,
-                observed.sent_timestamp_ms,
+    async def _force_observed_message(
+        self, observed: ObservedMessage, now_ms: int
+    ) -> ForceCheckResult:
+        alarm = self.database.get_alarm_by_identity(
+            observed.group_id,
+            observed.sender_aci,
+            observed.sent_timestamp_ms,
+        )
+        created = False
+        if alarm is None:
+            alarm = await self._create_alarm(
+                group_id=observed.group_id,
+                trigger_author_aci=observed.sender_aci,
+                trigger_timestamp_ms=observed.sent_timestamp_ms,
+                tracking_started_at_ms=now_ms,
+                source="custom",
             )
-            created = False
             if alarm is None:
-                alarm = await self._create_alarm(
-                    group_id=observed.group_id,
-                    trigger_author_aci=observed.sender_aci,
-                    trigger_timestamp_ms=observed.sent_timestamp_ms,
-                    tracking_started_at_ms=now_ms,
-                    source="custom",
+                alarm = self.database.get_alarm_by_identity(
+                    observed.group_id,
+                    observed.sender_aci,
+                    observed.sent_timestamp_ms,
                 )
-                if alarm is None:
-                    alarm = self.database.get_alarm_by_identity(
-                        observed.group_id,
-                        observed.sender_aci,
-                        observed.sent_timestamp_ms,
-                    )
-                else:
-                    created = True
-                    await self._replay_observed_reactions(alarm, observed, now_ms)
-                    alarm = self.database.get_alarm(alarm.id)
-            if alarm is None:
-                return ForceCheckResult("message_not_found")
-            return await self._force_alarm(alarm, now_ms, created=created)
+            else:
+                created = True
+        if alarm is None:
+            return ForceCheckResult("message_not_found")
+        if alarm.is_active:
+            await self._replay_observed_reactions(alarm, observed, now_ms)
+            alarm = self.database.get_alarm(alarm.id)
+        return await self._force_alarm(alarm, now_ms, created=created)
 
     def _trigger_author_allowed(self, aci: str) -> bool:
         return (
@@ -135,6 +157,14 @@ class AlertTracker:
         if not self._trigger_author_allowed(event.sender_aci):
             return
         if normalized not in self.config.trigger_texts:
+            return
+        if event.sent_timestamp_ms < self.service_started_at_ms:
+            LOGGER.info(
+                "Ignoring pre-start check for automatic processing: "
+                "message_timestamp_ms=%d service_started_at_ms=%d",
+                event.sent_timestamp_ms,
+                self.service_started_at_ms,
+            )
             return
 
         existing = self.database.get_alarm_by_identity(
@@ -265,6 +295,7 @@ class AlertTracker:
             group_id=event.group_id,
             trigger_timestamp_ms=event.target_timestamp_ms,
             target_author_aci=event.target_author_aci,
+            started_at_or_after_ms=self.service_started_at_ms,
         )
         if not targets:
             return
@@ -349,28 +380,43 @@ class AlertTracker:
         # Strict priority: a TTL-expired alarm performs no Signal operation.
         await self._expire_due(now_ms)
 
-        # Recover a completion transition whose reaction state committed before a
-        # crash. Existing durable operation claims make this restart-safe.
-        for alarm in self.database.list_alarms():
-            if alarm.is_active and not alarm.missing_members:
+        # Recover a completion transition committed during this process before the
+        # next processing pass. Pre-start sessions are deliberately not resumed.
+        for alarm in self.database.list_active_alarms(
+            started_at_or_after_ms=self.service_started_at_ms
+        ):
+            if not alarm.missing_members:
                 await self._complete_alarm(alarm.id, now_ms)
 
         if self.config.intermediate_check_enabled:
-            for alarm in self.database.list_due_intermediate(now_ms):
+            for alarm in self.database.list_due_intermediate(
+                now_ms, started_at_or_after_ms=self.service_started_at_ms
+            ):
                 await self._process_intermediate(alarm.id, now_ms)
 
-        for alarm in self.database.list_due_final(now_ms):
+        for alarm in self.database.list_due_final(
+            now_ms, started_at_or_after_ms=self.service_started_at_ms
+        ):
             await self._process_final(alarm.id, now_ms)
 
-        for alarm in self.database.list_due_edits(now_ms):
+        for alarm in self.database.list_due_edits(
+            now_ms, started_at_or_after_ms=self.service_started_at_ms
+        ):
             await self._process_edit(alarm.id, now_ms)
 
         removed = self.database.cleanup_observed_history(now_ms)
         if removed:
             LOGGER.info("Removed %d expired observed Signal candidate message(s)", removed)
 
-    async def _expire_due(self, now_ms: int) -> None:
-        for alarm in self.database.expire_due_alarms(now_ms):
+    async def _expire_due(
+        self, now_ms: int, *, include_pre_start: bool = False
+    ) -> None:
+        started_at_or_after_ms = (
+            None if include_pre_start else self.service_started_at_ms
+        )
+        for alarm in self.database.expire_due_alarms(
+            now_ms, started_at_or_after_ms=started_at_or_after_ms
+        ):
             LOGGER.info(
                 "Silently expired alert %s at its active-check TTL",
                 alarm.trigger_timestamp_ms,

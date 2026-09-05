@@ -122,7 +122,7 @@ def test_intermediate_survives_restart_without_duplicate(
         database2.close()
 
 
-def test_disabled_intermediate_skips_restart_and_still_runs_final(
+def test_disabled_intermediate_does_not_resume_pre_restart_alarm(
     app_config, roster, tmp_path: Path
 ) -> None:
     config = replace(app_config, intermediate_check_enabled=False)
@@ -161,17 +161,16 @@ def test_disabled_intermediate_skips_restart_and_still_runs_final(
         assert intermediate.attempt_count == 0
 
         run(tracker2.process_due(TRIGGER_TS + 10_000))
-        assert len(publisher2.sends) == 1
-        assert not publisher2.sends[0].startswith("Проміжна перевірка")
-        assert database2.list_alarms()[0].status == "reported"
+        assert publisher2.sends == []
+        assert database2.list_alarms()[0].status == "pending"
         intermediate = database2.get_outgoing(intermediate_key)
         final = database2.get_outgoing("alarm:1:final")
         assert intermediate is not None
-        assert intermediate.state == "skipped"
+        assert intermediate.state == "due_not_attempted"
         assert intermediate.attempt_count == 0
         assert final is not None
-        assert final.state == "attempted_success"
-        assert final.attempt_count == 1
+        assert final.state == "not_due"
+        assert final.attempt_count == 0
     finally:
         database2.close()
 
@@ -328,7 +327,9 @@ def test_ttl_silently_expires_pending_or_reported(
         database.close()
 
 
-def test_restart_after_ttl_expires_only(app_config, roster, tmp_path: Path) -> None:
+def test_restart_does_not_expire_pre_restart_alarm_automatically(
+    app_config, roster, tmp_path: Path
+) -> None:
     path = tmp_path / "ttl.sqlite3"
     clock = Clock(TRIGGER_TS)
     database, _, tracker = build(app_config, roster, clock, path)
@@ -339,7 +340,7 @@ def test_restart_after_ttl_expires_only(app_config, roster, tmp_path: Path) -> N
     database2, publisher2, tracker2 = build(app_config, roster, clock, path)
     try:
         run(tracker2.process_due())
-        assert database2.list_alarms()[0].status == "expired"
+        assert database2.list_alarms()[0].status == "pending"
         assert publisher2.sends == []
         assert publisher2.edits == []
     finally:
