@@ -20,6 +20,7 @@ def test_example_config_is_structurally_valid() -> None:
     assert config.intermediate_check_enabled is True
     assert config.intermediate_check_seconds == 300
     assert config.active_check_ttl_seconds == 21_600
+    assert config.auto_host_reaction is True
     assert config.command_group_id
     assert config.command_author_uuids == frozenset()
     assert config.state_db == Path("/var/lib/sheltercheck/state.sqlite3")
@@ -75,6 +76,34 @@ def test_existing_config_without_intermediate_enabled_uses_true(tmp_path: Path) 
 
     config = load_config(path, require_groups=False)
     assert config.intermediate_check_enabled is True
+
+
+def test_existing_config_without_auto_host_reaction_uses_true(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "config.example.toml").read_text(encoding="utf-8")
+    text = text.replace("auto_host_reaction = true\n", "")
+    path = tmp_path / "legacy-auto-host-reaction.toml"
+    path.write_text(text, encoding="utf-8")
+
+    config = load_config(path, require_groups=False)
+    assert config.auto_host_reaction is True
+
+
+@pytest.mark.parametrize("invalid_value", ['"false"', "0", "1"])
+def test_auto_host_reaction_requires_boolean(
+    tmp_path: Path, invalid_value: str
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "config.example.toml").read_text(encoding="utf-8")
+    text = text.replace(
+        "auto_host_reaction = true",
+        f"auto_host_reaction = {invalid_value}",
+    )
+    path = tmp_path / "bad-auto-host-reaction.toml"
+    path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="auto_host_reaction must be a boolean"):
+        load_config(path, require_groups=False)
 
 
 @pytest.mark.parametrize("invalid_value", ['"false"', "0", "1"])

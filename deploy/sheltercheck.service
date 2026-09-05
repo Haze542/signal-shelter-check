@@ -1,10 +1,10 @@
 [Unit]
 Description=Signal shelter reaction tracker
 After=network-online.target signal-cli.service
-Wants=network-online.target
-Requires=signal-cli.service
-StartLimitIntervalSec=60
-StartLimitBurst=5
+Wants=network-online.target signal-cli.service
+# A hard Requires= leaves this unit failed after signal-cli's first failed start,
+# even if signal-cli later recovers via Restart=. ExecStartPre is the readiness gate.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -13,9 +13,11 @@ Group=sheltercheck
 WorkingDirectory=/var/lib/sheltercheck
 Environment=PYTHONUNBUFFERED=1
 ExecStartPre=/opt/sheltercheck/.venv/bin/python -m sheltercheck --config /etc/sheltercheck/config.toml --validate-config
+ExecStartPre=/opt/sheltercheck/.venv/bin/python /opt/sheltercheck/signal_cli_readiness.py --url http://127.0.0.1:8080 --timeout-seconds 30
 ExecStart=/opt/sheltercheck/.venv/bin/python -m sheltercheck --config /etc/sheltercheck/config.toml
 Restart=on-failure
-RestartSec=5
+RestartSec=10
+TimeoutStartSec=45
 TimeoutStopSec=30
 UMask=0077
 

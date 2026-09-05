@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from dataclasses import replace
 from datetime import timezone
 from pathlib import Path
 
@@ -28,6 +29,7 @@ class FakePublisher:
     def __init__(self) -> None:
         self.sends: list[str] = []
         self.edits: list[tuple[int, str]] = []
+        self.reactions: list[tuple[str, str, int, str]] = []
         self.next_timestamp = 9_000_000
 
     async def send(self, message: str) -> int:
@@ -37,6 +39,19 @@ class FakePublisher:
 
     async def edit(self, message: str, edit_timestamp_ms: int) -> None:
         self.edits.append((edit_timestamp_ms, message))
+
+    async def react(
+        self,
+        group_id: str,
+        target_author_aci: str,
+        target_timestamp_ms: int,
+        emoji: str,
+    ) -> int:
+        self.reactions.append(
+            (group_id, target_author_aci, target_timestamp_ms, emoji)
+        )
+        self.next_timestamp += 1
+        return self.next_timestamp
 
 
 def run(coroutine: object) -> object:
@@ -87,6 +102,48 @@ def test_valid_trigger_duplicate_and_filters(app_config, roster) -> None:
         assert len(alarms) == 1
         assert len(alarms[0].released_members) == 3
         assert publisher.sends == []
+        assert publisher.reactions == [
+            ("monitor-group", AUTHOR, TRIGGER_TS, "➕")
+        ]
+    finally:
+        database.close()
+
+
+def test_auto_host_reaction_can_be_disabled_without_disabling_tracking(
+    app_config, roster
+) -> None:
+    config = replace(app_config, auto_host_reaction=False)
+    clock = Clock(TRIGGER_TS)
+    database, publisher, tracker = build(config, roster, clock)
+    try:
+        run(tracker.handle_event(trigger()))
+        assert len(database.list_alarms()) == 1
+        assert publisher.reactions == []
+
+        run(tracker.handle_event(reaction(ACI_1)))
+        assert database.list_alarms()[0].responded_acis == frozenset({ACI_1})
+    finally:
+        database.close()
+
+
+def test_auto_host_reaction_is_a_single_durable_attempt(app_config, roster) -> None:
+    clock = Clock(TRIGGER_TS)
+    database, publisher, tracker = build(app_config, roster, clock)
+    try:
+        event = trigger()
+        run(tracker.handle_event(event))
+        run(tracker.handle_event(event))
+
+        assert publisher.reactions == [
+            ("monitor-group", AUTHOR, TRIGGER_TS, "➕")
+        ]
+        alarm = database.list_alarms()[0]
+        operation = database.get_outgoing(
+            database.alarm_operation_key(alarm.id, "host_reaction")
+        )
+        assert operation is not None
+        assert operation.state == "attempted_success"
+        assert operation.attempt_count == 1
     finally:
         database.close()
 

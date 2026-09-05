@@ -80,6 +80,14 @@ class ReportPublisher(Protocol):
 
     async def edit(self, message: str, edit_timestamp_ms: int) -> None: ...
 
+    async def react(
+        self,
+        group_id: str,
+        target_author_aci: str,
+        target_timestamp_ms: int,
+        emoji: str,
+    ) -> int: ...
+
 
 class SignalReportPublisher:
     def __init__(self, client: SignalClient, report_group_id: str) -> None:
@@ -92,6 +100,20 @@ class SignalReportPublisher:
     async def edit(self, message: str, edit_timestamp_ms: int) -> None:
         await self._client.edit_group_message(
             self._group_id, message, edit_timestamp_ms
+        )
+
+    async def react(
+        self,
+        group_id: str,
+        target_author_aci: str,
+        target_timestamp_ms: int,
+        emoji: str,
+    ) -> int:
+        return await self._client.send_group_reaction(
+            group_id,
+            target_author_aci,
+            target_timestamp_ms,
+            emoji,
         )
 
 
@@ -110,6 +132,22 @@ class DryRunReportPublisher:
             f"\n[DRY RUN] Would edit report {edit_timestamp_ms}:\n{message}\n",
             flush=True,
         )
+
+    async def react(
+        self,
+        group_id: str,
+        target_author_aci: str,
+        target_timestamp_ms: int,
+        emoji: str,
+    ) -> int:
+        print(
+            f"\n[DRY RUN] Would react {emoji} to Signal message "
+            f"{target_timestamp_ms} in {group_id}\n",
+            flush=True,
+        )
+        now = time.time_ns() // 1_000_000
+        self._last_timestamp = max(now, self._last_timestamp + 1)
+        return self._last_timestamp
 
 
 def report_for_alarm(alarm: AlarmSession, *, timezone: tzinfo | None = None) -> str:

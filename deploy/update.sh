@@ -15,12 +15,28 @@ WAS_ACTIVE=0
 if systemctl is-active --quiet sheltercheck.service; then
     WAS_ACTIVE=1
 fi
+SIGNAL_WAS_ACTIVE=0
+if systemctl is-active --quiet signal-cli.service; then
+    SIGNAL_WAS_ACTIVE=1
+fi
 
 "${SCRIPT_DIR}/install.sh"
 
 runuser -u sheltercheck -- /opt/sheltercheck/.venv/bin/python -m sheltercheck \
     --config /etc/sheltercheck/config.toml \
     --validate-config
+
+if [[ ${SIGNAL_WAS_ACTIVE} -eq 1 ]]; then
+    if ! systemctl restart signal-cli.service; then
+        printf '\nsignal-cli failed its first readiness check; waiting for automatic recovery.\n'
+    fi
+    runuser -u sheltercheck -- \
+        /opt/sheltercheck/.venv/bin/python \
+        /opt/sheltercheck/signal_cli_readiness.py \
+            --url http://127.0.0.1:8080 \
+            --timeout-seconds 180 \
+            --wait-for-account
+fi
 
 if [[ ${WAS_ACTIVE} -eq 1 ]]; then
     systemctl restart sheltercheck.service

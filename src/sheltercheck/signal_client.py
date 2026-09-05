@@ -105,6 +105,8 @@ class SignalClient:
         return self._session
 
     async def check_health(self) -> None:
+        """Require both the HTTP daemon and one usable loaded account."""
+
         session = self._require_session()
         try:
             async with session.get(f"{self.base_url}/api/v1/check") as response:
@@ -116,8 +118,40 @@ class SignalClient:
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             raise SignalClientError(f"signal-cli health check failed: {exc}") from exc
 
+        accounts = await self.list_accounts()
+        if not accounts:
+            raise SignalClientError(
+                "signal-cli readiness check failed: no accounts loaded"
+            )
+        if len(accounts) != 1:
+            raise SignalClientError(
+                "signal-cli readiness check failed: this deployment requires "
+                "exactly one loaded account"
+            )
+
+    async def list_accounts(self) -> tuple[str, ...]:
+        result = await self.rpc("listAccounts", {})
+        if not isinstance(result, list):
+            raise SignalClientError("signal-cli listAccounts result is not an array")
+
+        accounts: list[str] = []
+        for entry in result:
+            if isinstance(entry, str):
+                account = entry.strip()
+            elif isinstance(entry, dict):
+                number = entry.get("number")
+                account = number.strip() if isinstance(number, str) else ""
+            else:
+                account = ""
+            if not account:
+                raise SignalClientError(
+                    "signal-cli listAccounts returned an invalid account entry"
+                )
+            accounts.append(account)
+        return tuple(accounts)
+
     async def rpc(self, method: str, params: dict[str, Any]) -> Any:
-        if method == "send":
+        if method in {"send", "sendReaction"}:
             self._ensure_outgoing_enabled()
         session = self._require_session()
         request_id = uuid.uuid4().hex
@@ -184,6 +218,26 @@ class SignalClient:
                     "groupId": group_id,
                     "message": message,
                     "editTimestamp": edit_timestamp_ms,
+                },
+            )
+            return self._validate_send_result(result)
+
+    async def send_group_reaction(
+        self,
+        group_id: str,
+        target_author_aci: str,
+        target_timestamp_ms: int,
+        emoji: str,
+    ) -> int:
+        async with self._outgoing_lock:
+            self._ensure_outgoing_enabled()
+            result = await self.rpc(
+                "sendReaction",
+                {
+                    "groupId": group_id,
+                    "emoji": emoji,
+                    "targetAuthor": target_author_aci,
+                    "targetTimestamp": target_timestamp_ms,
                 },
             )
             return self._validate_send_result(result)

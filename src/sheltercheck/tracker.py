@@ -79,7 +79,7 @@ class AlertTracker:
             observed = self.database.find_latest_observed_message(
                 group_id=self.config.monitor_group_id,
                 normalized_text=normalize_text(text),
-                allowed_authors=tuple(self.config.trigger_author_uuids),
+                allowed_authors=(),
             )
             if observed is None:
                 return ForceCheckResult("message_not_found")
@@ -121,8 +121,6 @@ class AlertTracker:
     async def _handle_message(self, event: MessageEvent) -> None:
         if event.group_id != self.config.monitor_group_id:
             return
-        if not self._trigger_author_allowed(event.sender_aci):
-            return
 
         normalized = normalize_text(event.text)
         self.database.observe_message(
@@ -134,6 +132,8 @@ class AlertTracker:
         )
         now_ms = self._clock_ms()
         self.database.cleanup_observed_history(now_ms)
+        if not self._trigger_author_allowed(event.sender_aci):
+            return
         if normalized not in self.config.trigger_texts:
             return
 
@@ -162,8 +162,37 @@ class AlertTracker:
             event.sent_timestamp_ms,
             len(alarm.released_members),
         )
+        await self._auto_host_react(alarm, now_ms)
         if not alarm.missing_members:
             await self._complete_alarm(alarm.id, now_ms)
+
+    async def _auto_host_react(self, alarm: AlarmSession, now_ms: int) -> None:
+        if not self.config.auto_host_reaction:
+            return
+
+        emoji = min(self.config.accepted_reactions)
+        key = self.database.alarm_operation_key(alarm.id, "host_reaction")
+        self.database.prepare_outgoing(
+            operation_key=key,
+            alarm_id=alarm.id,
+            kind="host_reaction",
+            state="due_not_attempted",
+            message=emoji,
+            target_timestamp_ms=alarm.trigger_timestamp_ms,
+            now_ms=now_ms,
+        )
+        result = await attempt_outgoing_once(
+            self.database,
+            key,
+            now_ms=now_ms,
+            write=lambda: self.publisher.react(
+                alarm.group_id,
+                alarm.trigger_author_aci,
+                alarm.trigger_timestamp_ms,
+                emoji,
+            ),
+        )
+        self._log_attempt("host reaction", alarm, result)
 
     async def _create_alarm(
         self,
@@ -224,18 +253,12 @@ class AlertTracker:
             return
         if event.emoji not in self.config.accepted_reactions:
             return
-        if (
-            event.target_author_aci is not None
-            and not self._trigger_author_allowed(event.target_author_aci)
-        ):
-            return
-
         observed = self.database.resolve_observed_reaction_target(
             group_id=event.group_id,
             target_timestamp_ms=event.target_timestamp_ms,
             target_author_aci=event.target_author_aci,
         )
-        if observed is not None and self._trigger_author_allowed(observed.sender_aci):
+        if observed is not None:
             self.database.observe_reaction(target=observed, event=event)
 
         targets = self.database.find_active_reaction_targets(

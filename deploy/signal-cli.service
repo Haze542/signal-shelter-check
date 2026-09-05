@@ -3,8 +3,8 @@ Description=signal-cli HTTP daemon for ShelterCheck
 Documentation=https://github.com/AsamK/signal-cli
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=60
-StartLimitBurst=5
+# Keep retrying after delayed boot networking, but never as a tight loop.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -13,8 +13,10 @@ Group=sheltercheck
 WorkingDirectory=/var/lib/sheltercheck
 Environment=HOME=/var/lib/sheltercheck
 ExecStart=/opt/sheltercheck/signal-cli --scrub-log --data-dir /var/lib/sheltercheck/signal-cli daemon --http 127.0.0.1:8080 --no-receive-stdout --ignore-attachments --ignore-stories --ignore-avatars --ignore-stickers
+ExecStartPost=/opt/sheltercheck/.venv/bin/python /opt/sheltercheck/signal_cli_readiness.py --url http://127.0.0.1:8080 --timeout-seconds 30
 Restart=on-failure
-RestartSec=5
+RestartSec=10
+TimeoutStartSec=45
 TimeoutStopSec=30
 UMask=0077
 

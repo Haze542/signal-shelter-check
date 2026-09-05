@@ -12,6 +12,11 @@ ShelterCheck автоматично контролює перевірки в Sig
 Програма також дозволяє авторизованим користувачам команд керувати списком
 звільнених через Signal.
 
+Поточна версія — **v0.2.3**. У ній `/check <текст>` може вибрати повідомлення
+будь-якого автора, автоматична reaction host-акаунта стала configurable, а
+готовність signal-cli означає не лише відкритий HTTP port, а й рівно один
+завантажений account.
+
 ## Швидкий старт
 
 Цей розділ розрахований на користувача без досвіду роботи з Python і systemd.
@@ -149,11 +154,19 @@ trigger_author_uuids = [
 command_author_uuids = [
     "ACI_UUID_АВТОРИЗОВАНОГО_КОРИСТУВАЧА_КОМАНД"
 ]
+
+auto_host_reaction = true
 ```
 
 Порожній `command_author_uuids` безпечно вимикає адміністративні Signal-команди.
 Порожній `trigger_author_uuids` має іншу поведінку: будь-який учасник monitor group
 може створити перевірку.
+
+`auto_host_reaction` — optional boolean із default `true`. При `true` host-акаунт
+робить одну at-most-once attempt поставити одну з `accepted_reactions` на новий
+authorized `trigger_text`. При `false` ця outgoing reaction не надсилається, але
+AlarmSession створюється, timers працюють і reactions інших користувачів
+відстежуються як завжди. Старий config без цього key зберігає enabled-поведінку.
 
 Production paths уже задані правильно:
 
@@ -293,6 +306,8 @@ STATUS: OK
 ```
 
 Healthcheck не надсилає повідомлень у Signal.
+`Signal daemon: OK` означає, що `GET /api/v1/check` відповів і `listAccounts`
+повернув рівно один account. Відкритого порту без завантаженого account недостатньо.
 
 ### Щовечора: оновити released_today
 
@@ -344,7 +359,7 @@ Released list також можна змінювати дозволеними Si
 | `/delrt` + імена | Видалити людей зі списку. |
 | `/clearrt confirm` | Очистити список; без слова `confirm` очищення не відбудеться. |
 | `/check` | Виконати manual evaluation останньої стандартної перевірки. |
-| `/check <текст>` | Почати або перевірити session для найновішого отриманого повідомлення дозволеного автора з exact normalized text. |
+| `/check <текст>` | Почати або перевірити session для найновішого отриманого повідомлення будь-якого автора з exact normalized text. |
 | `/status` | Показати стан системи, uptime і detail найновішої активної перевірки. |
 | `/help` | Показати коротку довідку. |
 
@@ -354,15 +369,18 @@ final або TTL останньої standard-перевірки. Якщо вон
 
 `/check <текст>` потрібна для нестандартного контрольного повідомлення, якого немає
 в `trigger_texts`. ShelterChecker шукає найновіше повідомлення лише в
-`monitor_group_id`, лише від автора з `trigger_author_uuids`, і лише за exact equality
-після `normalize_text()` (Unicode NFKC, trim/collapse whitespace, casefold). Fuzzy,
-substring і regex matching немає.
+`monitor_group_id`, незалежно від автора, і лише за exact equality після
+`normalize_text()` (Unicode NFKC, trim/collapse whitespace, casefold). Fuzzy,
+substring і regex matching немає. Це виключення стосується тільки candidate message:
+саму `/check` і далі може виконати лише ACI з `command_author_uuids` у
+`command_group_id`. Автоматичні `trigger_texts` і далі застосовують
+`trigger_author_uuids`.
 
 ShelterChecker не читає server-side Signal history. Він може знайти тільки message і
 reactions, events яких реально отримав під час роботи. Для цього локально зберігається
-обмежена 24-годинна candidate history тільки для monitor group та дозволених
-авторів контрольних повідомлень. Add/remove reactions, отримані до `/check <текст>`, replay-яться за
-event timestamp, тому manual session одразу має правильний current response state.
+обмежена 24-годинна candidate history тільки для monitor group, але для всіх його
+авторів. Add/remove reactions, отримані до `/check <текст>`, replay-яться за event
+timestamp, тому manual session одразу має правильний current response state.
 
 Для custom session original timestamp релевантного повідомлення залишається reaction target і часом
 «Контрольного повідомлення». `tracking_started_at_ms` фіксується окремо в момент
@@ -401,9 +419,10 @@ git pull
 sudo ./deploy/update.sh
 ```
 
-Update повторно використовує безпечний installer, перевіряє config і перезапускає
-ShelterCheck лише якщо service працював до update. Config, roster, SQLite та Signal
-state не видаляються й не перезаписуються.
+Update повторно використовує безпечний installer, перевіряє config, оновлює
+readiness helper і unit-файли. Якщо services працювали, він спочатку перезапускає
+signal-cli, чекає semantic readiness, а тоді перезапускає ShelterCheck. Config,
+roster, SQLite та Signal state не видаляються й не перезаписуються.
 
 ### Backup
 
@@ -462,19 +481,20 @@ ARM64 build слід отримати з надійного джерела дл�
 
 | Проблема | Що робити |
 |---|---|
-| `Signal daemon: connection refused` | Виконайте `sudo systemctl status signal-cli` і `sudo systemctl restart signal-cli`, потім повторіть `--health`. |
+| `Signal daemon: connection refused` | Перегляньте `systemctl status signal-cli` та `journalctl -u signal-cli -n 100`; service сам retry-ить startup кожні 10 секунд. |
+| `no accounts loaded` після boot | Readiness навмисно валить цей startup attempt і systemd перезапускає signal-cli. Перевірте наступні записи journal; ручний restart зазвичай не потрібен. |
 | `unknown display_name` | У `released_today.txt` має бути точний `display_name` із `roster.csv`. Перевірте крапки, ініціали та пробіли всередині ПІБ. |
 | `trigger_author_uuids is empty` | Зараз будь-який учасник monitor group може запустити перевірку. Додайте ACI UUID дозволених авторів у `/etc/sheltercheck/config.toml`. |
 | `Roster: 0 members` | Перевірте `/var/lib/sheltercheck/roster.csv`: після CSV header має бути хоча б один коректний рядок. |
 | Програма не реагує на «Всі в укритті?» | Перевірте `signal-cli`, monitor group ID, ACI автора, точний trigger text і `journalctl -u sheltercheck -n 100`. |
-| Після reboot не працює | Виконайте `systemctl is-enabled signal-cli` і `systemctl is-enabled sheltercheck`. Якщо disabled — повторіть `sudo systemctl enable --now ...`. |
+| Після reboot не працює | Перевірте `systemctl is-enabled ...`, `listAccounts` у service data-dir і обидва journals. Якщо unit disabled — повторіть `sudo systemctl enable --now ...`. |
 | `--validate-config` показує permission denied | Перевірте власника й права через `sudo ./deploy/install.sh`; installer відновлює безпечні production permissions без зміни вмісту. |
-| Service постійно restart | Виконайте `journalctl -u sheltercheck -n 100 --no-pager` і виправте першу помилку. systemd обмежує частоту restart, щоб уникнути tight loop. |
+| Service постійно restart | Виконайте `journalctl -u signal-cli -u sheltercheck -n 100 --no-pager` і виправте першу readiness/config помилку. Між attempts є пауза 10 секунд. |
 
 Короткий checklist, якщо немає реакції на trigger:
 
-1. `systemctl status signal-cli` показує `active (running)`;
-2. `--health` показує `Signal daemon: OK`;
+1. `systemctl status signal-cli` показує `active (running)`, а не `activating`/`failed`;
+2. `--health` показує `Signal daemon: OK` — тобто HTTP і `listAccounts` готові;
 3. `monitor_group_id` збігається з реальною Signal-групою;
 4. ACI автора є в `trigger_author_uuids`, якщо allowlist не порожній;
 5. текст є в `trigger_texts`;
@@ -525,9 +545,9 @@ AlertTracker → SQLite state → report send/edit
 
 ShelterCheck використовує лише upstream endpoints:
 
-- `GET /api/v1/check` — health;
+- `GET /api/v1/check` — доступність HTTP daemon;
 - `GET /api/v1/events` — SSE events;
-- `POST /api/v1/rpc` — Signal JSON-RPC send/edit.
+- `POST /api/v1/rpc` — `listAccounts`, Signal JSON-RPC send/edit/reaction.
 
 Ці endpoints документовані в
 [signal-cli JSON-RPC manual](https://github.com/AsamK/signal-cli/blob/master/man/signal-cli-jsonrpc.5.adoc).
@@ -539,7 +559,8 @@ Config приймає лише loopback daemon URL. systemd unit явно bind-�
 ```text
 /opt/sheltercheck/
 ├── .venv/
-└── signal-cli -> system-wide signal-cli executable
+├── signal-cli -> system-wide signal-cli executable
+└── signal_cli_readiness.py       root:root 0755
 
 /etc/sheltercheck/
 └── config.toml                 root:sheltercheck 0640
@@ -558,20 +579,45 @@ template використовує absolute paths, тому service однако�
 ### systemd
 
 `signal-cli.service` запускається від `sheltercheck`, використовує окремий data-dir,
-не друкує повні received messages у journal і слухає лише loopback.
+не друкує повні received messages у journal і слухає лише loopback. Його
+`ExecStartPost` чекає HTTP API та виконує side-effect-free `listAccounts`. Порожній
+або неоднозначний account set завершує startup attempt помилкою; systemd зупиняє
+дефектний daemon і запускає новий attempt через 10 секунд. Start-rate limit
+вимкнений, тому тимчасово недоступні DNS/Internet не залишають service назавжди
+failed; retry loop не tight завдяки `RestartSec=10`.
+Readiness logs показують лише кількість account-ів і не друкують номер телефону.
 
 `sheltercheck.service`:
 
 - працює від `sheltercheck`, не root;
-- має `Requires/After=signal-cli.service`;
-- виконує `--validate-config` перед стартом;
+- має `Wants/After=signal-cli.service`;
+- виконує `--validate-config` і той самий semantic readiness probe перед стартом;
 - пише logs у systemd journal;
-- використовує `Restart=on-failure`, паузу 5 секунд і start-rate limit;
+- використовує `Restart=on-failure`, паузу 10 секунд і безпечний нескінченний retry;
 - має `NoNewPrivileges`, `PrivateTmp`, `PrivateDevices`, `ProtectHome`,
   `ProtectSystem=strict`;
 - має write access лише до `/var/lib/sheltercheck`.
 
-Unit запускає Python напряму, без shell wrapper.
+`Wants`, а не hard `Requires`, обрано навмисно: після першого failed startup
+signal-cli hard dependency могла б залишити ShelterCheck у стані `dependency failed`,
+не запустивши його після пізнішого успішного auto-restart. Власний `ExecStartPre`
+все одно не пропускає application process, доки account не завантажений.
+
+Startup flow:
+
+```text
+network-online.target
+        ↓
+signal-cli daemon + loopback HTTP
+        ↓
+ExecStartPost: GET /check + listAccounts == exactly one
+        ├─ not ready → startup failed → 10 s → restart signal-cli
+        └─ ready
+              ↓
+sheltercheck ExecStartPre: config + повторна semantic readiness
+              ↓
+ShelterCheck event loop / SSE
+```
 
 ### Identity, alert і persistence semantics
 
@@ -609,25 +655,29 @@ standard alarm вони однакові; для custom `/check <текст>` tr
 Кожна logical outgoing operation записується у SQLite до Signal RPC зі станом, що
 розрізняє `not_due`, `due_not_attempted`, success, explicit failure, uncertain
 delivery і skipped. Гарантія writes — **at-most-once attempt**. ShelterChecker не
-retry-ить failed sends, edits або command replies у ticker, після іншої події чи
-після restart. Timeout/connection reset після початку RPC вважається uncertain і
-також ніколи автоматично не повторюється. Це свідомо віддає перевагу пропущеному
-повідомленню над duplicate Signal message.
+retry-ить failed report sends, edits, host reactions або command replies у ticker,
+після іншої події чи після restart. Timeout/connection reset після початку RPC
+вважається uncertain і також ніколи автоматично не повторюється. Це свідомо віддає
+перевагу пропущеному повідомленню над duplicate Signal message/reaction.
 
 Signal send results перевіряються не лише за `timestamp`, а й за recipient `results`.
 Перший `RATE_LIMIT_FAILURE` або proof-required challenge latch-ить centralized
-outgoing circuit breaker у `SignalClient`. Усі наступні report sends, edits і command
-replies блокуються до RPC. Автоматичного reset за `retryAfterSeconds` немає; outgoing
-залишається disabled до restart process. Процес не завершується: incoming SSE,
-reaction tracking, SQLite transitions, TTL і local cleanup продовжують працювати.
+outgoing circuit breaker у `SignalClient`. Усі наступні report sends, edits, host
+reactions і command replies блокуються до RPC. Автоматичного reset за
+`retryAfterSeconds` немає; outgoing залишається disabled до restart process. Процес
+не завершується: incoming SSE, reaction tracking, SQLite transitions, TTL і local
+cleanup продовжують працювати.
 Rate limit записується лише в local critical log — ShelterChecker не намагається
 повідомити про нього через Signal.
 
 SQLite schema migrations виконуються backward-safe. Невідома або пошкоджена schema
 має завершити startup/health із помилкою, а не мовчки видалити state.
 
-`/status` показує health Signal, roster/current released counts, кількість лише
+`/status` показує semantic health Signal, roster/current released counts, кількість лише
 `pending/reported` sessions, last check і uptime поточного process із monotonic clock.
+`Signal: 🟢 connected` можливий тільки після успішного HTTP check і рівно одного
+account у `listAccounts`; HTTP daemon із порожнім account set показується як
+`🔴 disconnected`.
 Нижній block показує тільки latest active session та використовує її immutable
 released snapshot:
 
@@ -663,9 +713,9 @@ write використовує private temporary file в тому самому f
 
 - `signal-cli` API не можна публікувати через reverse proxy або firewall port-forward;
 - normal logs не містять телефонів або повних command payload;
-- observed history містить лише 24 години candidate messages дозволених авторів
-  контрольних повідомлень у monitor group та потрібні reaction events; це не архів
-  Signal chat;
+- observed history містить лише 24 години candidate messages усіх авторів у monitor
+  group та потрібні reaction events, щоб `/check <текст>` не залежав від автора; це
+  не server-side архів Signal chat;
 - unit використовує `--scrub-log --no-receive-stdout`;
 - `tools/dump_events.py` може показати personal data й призначений лише для локальної
   діагностики в ignored `debug_events/`;

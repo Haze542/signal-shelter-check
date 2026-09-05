@@ -19,6 +19,10 @@ accepted_reactions = [
     "➕"
 ]
 
+# Add a configured accepted reaction from the ShelterCheck host account when an
+# authorized trigger_text is received. Old configs without this key default to true.
+auto_host_reaction = true
+
 # Optional intermediate status report. Set to false to skip it completely.
 intermediate_check_enabled = true
 intermediate_check_seconds = 300

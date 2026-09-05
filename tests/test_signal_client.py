@@ -71,11 +71,45 @@ class FakeResponse:
         self.content = AsyncLines(lines)
 
 
+class HealthResponse:
+    status = 200
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        return None
+
+    async def read(self) -> bytes:
+        return b"ok"
+
+
+class HealthSession:
+    def get(self, url: str) -> HealthResponse:
+        return HealthResponse()
+
+
+class HealthClient(SignalClient):
+    def __init__(self, accounts: tuple[str, ...]) -> None:
+        super().__init__("http://127.0.0.1:8080")
+        self.accounts = accounts
+        self._session = HealthSession()  # type: ignore[assignment]
+
+    async def list_accounts(self) -> tuple[str, ...]:
+        return self.accounts
+
+
 def test_send_and_edit_use_upstream_json_rpc_parameter_names() -> None:
     async def exercise() -> None:
         client = RecordingClient()
         timestamp = await client.send_group_message("case/Sensitive=", "report")
         await client.edit_group_message("case/Sensitive=", "updated", timestamp)
+        await client.send_group_reaction(
+            "case/Sensitive=",
+            "00000000-0000-4000-8000-000000000010",
+            1_700_000_000_123,
+            "➕",
+        )
         assert client.calls == [
             ("send", {"groupId": "case/Sensitive=", "message": "report"}),
             (
@@ -86,9 +120,38 @@ def test_send_and_edit_use_upstream_json_rpc_parameter_names() -> None:
                     "editTimestamp": 1_700_000_000_000,
                 },
             ),
+            (
+                "sendReaction",
+                {
+                    "groupId": "case/Sensitive=",
+                    "emoji": "➕",
+                    "targetAuthor": "00000000-0000-4000-8000-000000000010",
+                    "targetTimestamp": 1_700_000_000_123,
+                },
+            ),
         ]
 
     asyncio.run(exercise())
+
+
+def test_list_accounts_accepts_supported_shapes_and_rejects_empty_readiness() -> None:
+    objects = ResultClient([{"number": "+380000000001"}])
+    strings = ResultClient(["+380000000001"])
+    empty = ResultClient([])
+
+    assert asyncio.run(objects.list_accounts()) == ("+380000000001",)
+    assert asyncio.run(strings.list_accounts()) == ("+380000000001",)
+    assert asyncio.run(empty.list_accounts()) == ()
+
+
+def test_health_requires_exactly_one_loaded_account() -> None:
+    asyncio.run(HealthClient(("+380000000001",)).check_health())
+    with pytest.raises(SignalClientError, match="no accounts loaded"):
+        asyncio.run(HealthClient(()).check_health())
+    with pytest.raises(SignalClientError, match="exactly one"):
+        asyncio.run(
+            HealthClient(("+380000000001", "+380000000002")).check_health()
+        )
 
 
 def test_sse_multiline_data_and_comments_are_parsed() -> None:

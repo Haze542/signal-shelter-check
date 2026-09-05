@@ -103,6 +103,9 @@ fi
     "${SOURCE_DIR}"
 "${APP_DIR}/.venv/bin/python" -c 'import sheltercheck'
 ln -sfn -- "${SIGNAL_CLI_BIN}" "${APP_DIR}/signal-cli"
+install -o root -g root -m 0755 \
+    "${SOURCE_DIR}/deploy/signal_cli_readiness.py" \
+    "${APP_DIR}/signal_cli_readiness.py"
 
 if [[ -L "${CONFIG_FILE}" ]]; then
     fail "Refusing to manage symlinked production config: ${CONFIG_FILE}"
@@ -185,5 +188,6 @@ NEXT STEPS:
 7. Check:
    systemctl status signal-cli.service --no-pager
    systemctl status sheltercheck.service --no-pager
+   journalctl -u signal-cli.service -n 50 --no-pager
    sudo -u sheltercheck /opt/sheltercheck/.venv/bin/python -m sheltercheck --config /etc/sheltercheck/config.toml --health
 EOF

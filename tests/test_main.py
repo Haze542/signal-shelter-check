@@ -2,9 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import sheltercheck
 from sheltercheck.__main__ import main
 
 from conftest import ACI_1, AUTHOR
+
+
+def test_package_version_is_v023() -> None:
+    assert sheltercheck.__version__ == "0.2.3"
 
 
 def test_validate_config_cli_remains_compatible(tmp_path: Path, capsys) -> None:

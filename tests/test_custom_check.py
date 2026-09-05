@@ -164,7 +164,7 @@ def test_custom_snapshot_is_taken_when_manual_tracking_starts(app_config, roster
         database.close()
 
 
-def test_custom_message_security_filters_group_and_author(app_config, roster) -> None:
+def test_custom_message_still_filters_group(app_config, roster) -> None:
     clock = Clock(TRIGGER_TS)
     database, publisher, tracker = build(app_config, roster, clock)
     try:
@@ -173,19 +173,62 @@ def test_custom_message_security_filters_group_and_author(app_config, roster) ->
                 custom_message("Секретна перевірка", group="wrong-group")
             )
         )
-        run(
-            tracker.handle_event(
-                custom_message(
-                    "Секретна перевірка",
-                    timestamp=TRIGGER_TS + 1,
-                    author=ACI_1,
-                )
-            )
-        )
         result = run(tracker.force_check_message("Секретна перевірка"))
         assert result.outcome == "message_not_found"
         assert database.list_alarms() == ()
         assert publisher.sends == []
+    finally:
+        database.close()
+
+
+def test_custom_check_finds_same_text_from_allowed_and_disallowed_authors(
+    app_config, roster
+) -> None:
+    for author in (AUTHOR, ACI_3):
+        clock = Clock(TRIGGER_TS)
+        database, _, tracker = build(app_config, roster, clock)
+        try:
+            run(
+                tracker.handle_event(
+                    custom_message("Всі в укритті?", author=author)
+                )
+            )
+            result = run(tracker.force_check_message("Всі в укритті?"))
+            assert result.outcome == "evaluated"
+            assert result.alarm is not None
+            assert result.alarm.trigger_author_aci == author
+        finally:
+            database.close()
+
+
+def test_custom_check_replays_and_tracks_reactions_for_disallowed_author(
+    app_config, roster
+) -> None:
+    clock = Clock(TRIGGER_TS)
+    database, _, tracker = build(app_config, roster, clock)
+    try:
+        run(
+            tracker.handle_event(
+                custom_message("Нестандартна перевірка", author=ACI_3)
+            )
+        )
+        run(
+            tracker.handle_event(
+                reaction(ACI_1, author=ACI_3, sent=TRIGGER_TS + 1)
+            )
+        )
+        result = run(tracker.force_check_message("Нестандартна перевірка"))
+        assert result.alarm is not None
+        assert result.alarm.responded_acis == frozenset({ACI_1})
+
+        run(
+            tracker.handle_event(
+                reaction(ACI_2, author=ACI_3, sent=TRIGGER_TS + 2)
+            )
+        )
+        assert database.list_alarms()[0].responded_acis == frozenset(
+            {ACI_1, ACI_2}
+        )
     finally:
         database.close()
 

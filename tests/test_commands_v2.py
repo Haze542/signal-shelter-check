@@ -140,6 +140,47 @@ def test_check_not_found_reply_does_not_claim_server_history(app_config, roster)
         database.close()
 
 
+def test_disallowed_message_author_does_not_gain_check_command_permission(
+    app_config, roster
+) -> None:
+    database, _, reports, commands, tracker, handler, wall, _ = build_integrated(
+        app_config, roster
+    )
+    try:
+        message_timestamp = TRIGGER_TS + 5_000
+        run(
+            tracker.handle_event(
+                MessageEvent(
+                    "monitor-group",
+                    ACI_2,
+                    message_timestamp,
+                    "Всі в укритті?",
+                )
+            )
+        )
+        wall.value = message_timestamp + 1
+
+        assert run(
+            handler.handle_event(
+                MessageEvent(
+                    "command-group",
+                    ACI_2,
+                    message_timestamp + 1,
+                    "/check Всі в укритті?",
+                )
+            )
+        ) is True
+        assert commands.messages == []
+        assert database.list_alarms() == ()
+
+        run(handler.handle_event(command("/check Всі в укритті?")))
+        assert "Перевірку розпочато" in reply(commands)
+        assert len(reports.sends) == 1
+        assert database.list_alarms()[0].trigger_author_aci == ACI_2
+    finally:
+        database.close()
+
+
 def test_status_without_active_check_and_monotonic_uptime(app_config, roster) -> None:
     database, _, _, commands, _, handler, _, monotonic = build_integrated(
         app_config, roster
@@ -157,6 +198,31 @@ def test_status_without_active_check_and_monotonic_uptime(app_config, roster) ->
         assert "Up time: 6 год 20 хв" in response
         assert response.endswith("Перевірка: неактивна")
         assert "Контрольне повідомлення:" not in response
+    finally:
+        database.close()
+
+
+def test_status_reports_signal_disconnected_when_semantic_health_fails(
+    app_config, roster
+) -> None:
+    database = StateDatabase(":memory:")
+    service = ReleasedListService(app_config.released_file)
+    publisher = FakeCommandPublisher()
+
+    async def not_ready() -> bool:
+        return False
+
+    handler = CommandHandler(
+        app_config,
+        roster,
+        service,
+        publisher,
+        database,
+        signal_health_check=not_ready,
+    )
+    try:
+        run(handler.handle_event(command("/status")))
+        assert "Signal: 🔴 disconnected" in reply(publisher)
     finally:
         database.close()
 

@@ -129,7 +129,7 @@ async def _run(
             )
 
             print(f"Roster: {len(roster)} members")
-            print("Signal daemon: connected")
+            print("Signal daemon: ready (1 account loaded)")
             print("Monitor group: configured")
             print("Report group: configured")
             if not config.trigger_author_uuids:

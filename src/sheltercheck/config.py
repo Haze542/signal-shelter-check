@@ -30,6 +30,7 @@ _REQUIRED_KEYS = {
     "released_file",
 }
 _OPTIONAL_KEYS = {
+    "auto_host_reaction",
     "command_group_id",
     "command_author_uuids",
     "connect_timeout_seconds",
@@ -100,6 +101,7 @@ class Config:
     state_db: Path
     roster_file: Path
     released_file: Path
+    auto_host_reaction: bool = True
     command_group_id: str = ""
     command_author_uuids: frozenset[str] = frozenset()
     connect_timeout_seconds: float = 5.0
@@ -273,6 +275,7 @@ def load_config(path: str | Path = "config.toml", *, require_groups: bool = True
         state_db=_resolve_path(config_dir, _string(data, "state_db")),
         roster_file=_resolve_path(config_dir, _string(data, "roster_file")),
         released_file=_resolve_path(config_dir, _string(data, "released_file")),
+        auto_host_reaction=_boolean(data, "auto_host_reaction", True),
         intermediate_check_enabled=intermediate_check_enabled,
         intermediate_check_seconds=intermediate_check_seconds,
         active_check_ttl_seconds=active_check_ttl_seconds,
